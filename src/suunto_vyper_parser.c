@@ -20,6 +20,8 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>	/* for snprintf */
+#include <string.h>	/* for strdup */
 
 #include <libdivecomputer/units.h>
 
@@ -41,6 +43,7 @@ struct suunto_vyper_parser_t {
 	unsigned int maxdepth;
 	unsigned int marker;
 	unsigned int ngasmixes;
+	unsigned int serial;
 	unsigned int oxygen[NGASMIXES];
 };
 
@@ -53,6 +56,9 @@ static const dc_parser_vtable_t suunto_vyper_parser_vtable = {
 	sizeof(suunto_vyper_parser_t),
 	DC_FAMILY_SUUNTO_VYPER,
 	suunto_vyper_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	suunto_vyper_parser_get_datetime, /* datetime */
 	suunto_vyper_parser_get_field, /* fields */
 	suunto_vyper_parser_samples_foreach, /* samples_foreach */
@@ -159,7 +165,7 @@ suunto_vyper_parser_cache (suunto_vyper_parser_t *parser)
 
 
 dc_status_t
-suunto_vyper_parser_create (dc_parser_t **out, dc_context_t *context)
+suunto_vyper_parser_create (dc_parser_t **out, dc_context_t *context, unsigned int serial)
 {
 	suunto_vyper_parser_t *parser = NULL;
 
@@ -179,6 +185,7 @@ suunto_vyper_parser_create (dc_parser_t **out, dc_context_t *context)
 	parser->maxdepth = 0;
 	parser->marker = 0;
 	parser->ngasmixes = 0;
+	parser->serial = serial;
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->oxygen[i] = 0;
 	}
@@ -229,17 +236,19 @@ suunto_vyper_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime
 	return DC_STATUS_SUCCESS;
 }
 
+#define BUFLEN 16
 
 static dc_status_t
 suunto_vyper_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value)
 {
 	suunto_vyper_parser_t *parser = (suunto_vyper_parser_t *) abstract;
-
 	const unsigned char *data = abstract->data;
-	unsigned int size = abstract->size;
 
 	dc_gasmix_t *gas = (dc_gasmix_t *) value;
 	dc_tank_t *tank = (dc_tank_t *) value;
+	dc_decomodel_t *decomodel = (dc_decomodel_t *) value;
+	dc_field_string_t *string = (dc_field_string_t *) value;
+	char buf[BUFLEN];
 
 	// Cache the data.
 	dc_status_t rc = suunto_vyper_parser_cache (parser);
@@ -298,6 +307,21 @@ suunto_vyper_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 			} else {
 				*((dc_divemode_t *) value) = DC_DIVEMODE_OC;
 			}
+			break;
+		case DC_FIELD_DECOMODEL:
+			decomodel->type = DC_DECOMODEL_RGBM;
+			decomodel->conservatism = (data[4] & 0x0F) / 3;
+			break;
+		case DC_FIELD_STRING:
+			switch(flags) {
+			case 0: /* serial */
+				string->desc = "Serial";
+				snprintf(buf, BUFLEN, "%u", parser->serial);
+				break;
+			default:
+				return DC_STATUS_UNSUPPORTED;
+			}
+			string->value = strdup(buf);
 			break;
 		default:
 			return DC_STATUS_UNSUPPORTED;

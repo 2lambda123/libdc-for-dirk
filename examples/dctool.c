@@ -24,10 +24,12 @@
 #endif
 
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <signal.h>
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #endif
@@ -48,7 +50,7 @@
 #define RESET 1
 #endif
 
-#if defined(__GLIBC__) || defined(__MINGW32__) || defined(BSD)
+#if defined(__GLIBC__) || defined(__MINGW32__) || defined(BSD) || defined(__ANDROID__)
 #define NOPERMUTATION "+"
 #else
 #define NOPERMUTATION ""
@@ -240,7 +242,8 @@ main (int argc, char *argv[])
 	}
 
 	// Translate the help option into a command.
-	char *argv_help[] = {(char *) "help", NULL, NULL};
+	char helpcmd[] = "help";
+	char *argv_help[] = {helpcmd, NULL, NULL};
 	if (help || argv[0] == NULL) {
 		if (argv[0]) {
 			argv_help[1] = argv[0];

@@ -29,8 +29,6 @@
 #include "parser-private.h"
 #include "array.h"
 
-#define C_ARRAY_SIZE(array) (sizeof (array) / sizeof *(array))
-
 #define COCHRAN_MODEL_COMMANDER_TM 0
 #define COCHRAN_MODEL_COMMANDER_PRE21000 1
 #define COCHRAN_MODEL_COMMANDER_AIR_NITROX 2
@@ -110,6 +108,9 @@ static const dc_parser_vtable_t cochran_commander_parser_vtable = {
 	sizeof(cochran_commander_parser_t),
 	DC_FAMILY_COCHRAN_COMMANDER,
 	cochran_commander_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	cochran_commander_parser_get_datetime, /* datetime */
 	cochran_commander_parser_get_field, /* fields */
 	cochran_commander_parser_samples_foreach, /* samples_foreach */

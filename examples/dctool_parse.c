@@ -24,9 +24,11 @@
 #endif
 
 #include <stdlib.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #endif
@@ -152,7 +154,7 @@ dctool_parse_run (int argc, char *argv[], dc_context_t *context, dc_descriptor_t
 		goto cleanup;
 	}
 
-	for (unsigned int i = 0; i < argc; ++i) {
+	for (int i = 0; i < argc; ++i) {
 		// Read the input file.
 		buffer = dctool_file_read (argv[i]);
 		if (buffer == NULL) {

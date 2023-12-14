@@ -1,9 +1,9 @@
 AM_CPPFLAGS = -I$(top_builddir)/include -I$(top_srcdir)/include
-AM_CFLAGS = $(LIBUSB_CFLAGS) $(HIDAPI_CFLAGS) $(BLUEZ_CFLAGS)
+AM_CFLAGS = $(LIBUSB_CFLAGS) $(LIBMTP_CFLAGS) $(HIDAPI_CFLAGS) $(BLUEZ_CFLAGS)
 
 lib_LTLIBRARIES = libdivecomputer.la
 
-libdivecomputer_la_LIBADD = $(LIBUSB_LIBS) $(HIDAPI_LIBS) $(BLUEZ_LIBS) -lm
+libdivecomputer_la_LIBADD = $(LIBUSB_LIBS) $(LIBMTP_LIBS) $(HIDAPI_LIBS) $(BLUEZ_LIBS) -lm
 libdivecomputer_la_LDFLAGS = \
 	-version-info $(DC_VERSION_LIBTOOL) \
 	-no-undefined \
@@ -64,24 +64,37 @@ libdivecomputer_la_SOURCES = \
 	diverite_nitekq.h diverite_nitekq.c diverite_nitekq_parser.c \
 	citizen_aqualand.h citizen_aqualand.c citizen_aqualand_parser.c \
 	divesystem_idive.h divesystem_idive.c divesystem_idive_parser.c \
-	platform.h \
+	platform.h platform.c \
 	ringbuffer.h ringbuffer.c \
 	rbstream.h rbstream.c \
 	checksum.h checksum.c \
 	array.h array.c \
-	field-cache.h field-cache.c \
 	buffer.c \
 	cochran_commander.h cochran_commander.c cochran_commander_parser.c \
 	tecdiving_divecomputereu.h tecdiving_divecomputereu.c tecdiving_divecomputereu_parser.c \
-	garmin.h garmin.c garmin_parser.c \
-	deepblu.h deepblu.c deepblu_parser.c \
 	mclean_extreme.h mclean_extreme.c mclean_extreme_parser.c \
+	liquivision_lynx.h liquivision_lynx.c liquivision_lynx_parser.c \
+	sporasub_sp2.h sporasub_sp2.c sporasub_sp2_parser.c \
+	deepsix_excursion.h deepsix_excursion.c deepsix_excursion_parser.c \
+	seac_screen.h seac_screen.c seac_screen_parser.c \
+	deepblu_cosmiq.h deepblu_cosmiq.c deepblu_cosmiq_parser.c \
+	oceans_s1_common.h oceans_s1_common.c \
+	oceans_s1.h oceans_s1.c oceans_s1_parser.c \
+	divesoft_freedom.h divesoft_freedom.c divesoft_freedom_parser.c \
+	hdlc.h hdlc.c \
+	packet.h packet.c \
 	socket.h socket.c \
 	irda.c \
+	usb.c \
 	usbhid.c \
 	bluetooth.c \
-	usb_storage.c \
 	custom.c
+
+# Not merged upstream yet
+libdivecomputer_la_SOURCES += \
+	usb_storage.c \
+	field-cache.h field-cache.c \
+	garmin.h garmin.c garmin_parser.c
 
 if OS_WIN32
 libdivecomputer_la_SOURCES += serial_win32.c
@@ -99,7 +112,7 @@ libdivecomputer.exp: libdivecomputer.symbols
 	$(AM_V_GEN) sed -e '/^$$/d' $< > $@
 
 .rc.lo:
-	$(AM_V_GEN) $(LIBTOOL) --silent --tag=CC --mode=compile $(RC) $(DEFS) $(DEFAULT_INCLUDES) $< -o $@
+	$(AM_V_GEN) $(LIBTOOL) --silent --tag=CC --mode=compile $(RC) $(DEFS) $(DEFAULT_INCLUDES) $(AM_CPPFLAGS) $< -o $@
 
 libdivecomputer.lo: revision.h
 

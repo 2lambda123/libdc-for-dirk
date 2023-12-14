@@ -20,6 +20,8 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>	/* for snprintf */
+#include <string.h>	/* for strdup */
 
 #include <libdivecomputer/units.h>
 
@@ -31,6 +33,12 @@
 
 #define ISINSTANCE(parser) dc_parser_isinstance((parser), &mares_iconhd_parser_vtable)
 
+#define OBJVERSION(major,minor) ( \
+		(((major) & 0xFF) << 8) | \
+		((minor) & 0xFF))
+
+#define UNSUPPORTED 0xFFFFFFFF
+
 #define SMART      0x000010
 #define SMARTAPNEA 0x010010
 #define ICONHD    0x14
@@ -38,6 +46,7 @@
 #define GENIUS    0x1C
 #define QUADAIR   0x23
 #define SMARTAIR  0x24
+#define HORIZON   0x2C
 
 #define NGASMIXES_ICONHD 3
 #define NGASMIXES_GENIUS 5
@@ -58,6 +67,8 @@
 #define GENIUS_TRIMIX        3
 #define GENIUS_GAUGE         4
 #define GENIUS_FREEDIVE      5
+#define GENIUS_SCR           6
+#define GENIUS_OC            7
 
 // Record types and sizes
 #define DSTR_TYPE 0x44535452 // Dive start record
@@ -66,6 +77,8 @@
 #define TISS_SIZE 138
 #define DPRS_TYPE 0x44505253 // Sample record
 #define DPRS_SIZE 34
+#define SDPT_TYPE 0x53445054 // SCR sample record
+#define SDPT_SIZE 78
 #define AIRS_TYPE 0x41495253 // Air integration record
 #define AIRS_SIZE 16
 #define DEND_TYPE 0x44454E44 // Dive end record
@@ -76,8 +89,8 @@
 #define GASMIX_INUSE 2
 #define GASMIX_IGNRD 3
 
-#define WATER_SALT    0
-#define WATER_FRESH   1
+#define WATER_FRESH   0
+#define WATER_SALT    1
 #define WATER_EN13319 2
 
 #define ALARM_NONE                 0
@@ -111,6 +124,19 @@
 
 typedef struct mares_iconhd_parser_t mares_iconhd_parser_t;
 
+typedef struct mares_iconhd_layout_t {
+	unsigned int settings;
+	unsigned int datetime;
+	unsigned int divetime;
+	unsigned int maxdepth;
+	unsigned int atmospheric;
+	unsigned int atmospheric_divisor;
+	unsigned int temperature_min;
+	unsigned int temperature_max;
+	unsigned int gasmixes;
+	unsigned int tanks;
+} mares_iconhd_layout_t;
+
 typedef struct mares_iconhd_gasmix_t {
 	unsigned int oxygen;
 	unsigned int helium;
@@ -128,17 +154,117 @@ struct mares_iconhd_parser_t {
 	unsigned int model;
 	// Cached fields.
 	unsigned int cached;
+	unsigned int logformat;
 	unsigned int mode;
 	unsigned int nsamples;
 	unsigned int samplesize;
 	unsigned int headersize;
 	unsigned int settings;
+	unsigned int surftime;
 	unsigned int interval;
 	unsigned int samplerate;
 	unsigned int ntanks;
 	unsigned int ngasmixes;
+	unsigned int serial;
 	mares_iconhd_gasmix_t gasmix[NGASMIXES];
 	mares_iconhd_tank_t tank[NTANKS];
+	const mares_iconhd_layout_t *layout;
+};
+
+static const mares_iconhd_layout_t iconhd = {
+	0x0C, /* settings */
+	0x02, /* datetime */
+	UNSUPPORTED, /* divetime */
+	0x00, /* maxdepth */
+	0x22, 8, /* atmospheric */
+	0x42, /* temperature_min */
+	0x44, /* temperature_max */
+	0x10, /* gasmixes */
+	UNSUPPORTED, /* tanks */
+};
+
+static const mares_iconhd_layout_t iconhdnet = {
+	0x0C, /* settings */
+	0x02, /* datetime */
+	UNSUPPORTED, /* divetime */
+	0x00, /* maxdepth */
+	0x22, 8, /* atmospheric */
+	0x42, /* temperature_min */
+	0x44, /* temperature_max */
+	0x10, /* gasmixes */
+	0x58, /* tanks */
+};
+
+static const mares_iconhd_layout_t smartair = {
+	0x0C, /* settings */
+	0x02, /* datetime */
+	UNSUPPORTED, /* divetime */
+	0x00, /* maxdepth */
+	0x22, 8, /* atmospheric */
+	0x42, /* temperature_min */
+	0x44, /* temperature_max */
+	0x10, /* gasmixes */
+	0x5C, /* tanks */
+};
+
+static const mares_iconhd_layout_t smartapnea = {
+	0x1C, /* settings */
+	0x40, /* datetime */
+	0x24, /* divetime */
+	0x3A, /* maxdepth */
+	0x38, 1, /* atmospheric */
+	0x3E, /* temperature_min */
+	0x3C, /* temperature_max */
+	UNSUPPORTED, /* gasmixes */
+	UNSUPPORTED, /* tanks */
+};
+
+static const mares_iconhd_layout_t smart_freedive = {
+	0x08, /* settings */
+	0x20, /* datetime */
+	0x0C, /* divetime */
+	0x1A, /* maxdepth */
+	0x18, 1, /* atmospheric */
+	0x1C, /* temperature_min */
+	0x1E, /* temperature_max */
+	UNSUPPORTED, /* gasmixes */
+	UNSUPPORTED, /* tanks */
+};
+
+static const mares_iconhd_layout_t smartair_freedive = {
+	0x08, /* settings */
+	0x22, /* datetime */
+	0x0E, /* divetime */
+	0x1C, /* maxdepth */
+	0x1A, 1, /* atmospheric */
+	0x20, /* temperature_min */
+	0x1E, /* temperature_max */
+	UNSUPPORTED, /* gasmixes */
+	UNSUPPORTED, /* tanks */
+};
+
+static const mares_iconhd_layout_t genius = {
+	0x0C, /* settings */
+	0x08, /* datetime */
+	UNSUPPORTED, /* divetime */
+	0x22, /* maxdepth */
+	0x3E, 1, /* atmospheric */
+	0x28, /* temperature_min */
+	0x26, /* temperature_max */
+	0x54, /* gasmixes */
+	0x54, /* tanks */
+};
+
+static const mares_iconhd_layout_t horizon = {
+	0x0C, /* settings */
+	0x08, /* datetime */
+	UNSUPPORTED, /* divetime */
+	0x22 + 8, /* maxdepth */
+	0x3E + 8, 1, /* atmospheric */
+	0x28 + 8, /* temperature_min */
+	0x26 + 8, /* temperature_max */
+	0x54 + 8, /* gasmixes */
+	0x54 + 8, /* tanks */
 };
 
 static dc_status_t mares_iconhd_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsigned int size);
@@ -150,6 +276,9 @@ static const dc_parser_vtable_t mares_iconhd_parser_vtable = {
 	sizeof(mares_iconhd_parser_t),
 	DC_FAMILY_MARES_ICONHD,
 	mares_iconhd_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	mares_iconhd_parser_get_datetime, /* datetime */
 	mares_iconhd_parser_get_field, /* fields */
 	mares_iconhd_parser_samples_foreach, /* samples_foreach */
@@ -170,7 +299,7 @@ mares_genius_isvalid (const unsigned char data[], size_t size, unsigned int type
 	}
 
 	unsigned short crc = array_uint16_le(data + size - 6);
-	unsigned short ccrc = checksum_crc16_ccitt(data + 4, size - 10, 0x0000);
+	unsigned short ccrc = checksum_crc16_ccitt(data + 4, size - 10, 0x0000, 0x0000);
 	if (crc != ccrc) {
 		return 0;
 	}
@@ -222,23 +351,39 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 	// Get the header and sample size.
 	unsigned int headersize = 0x5C;
 	unsigned int samplesize = 8;
+	const mares_iconhd_layout_t *layout = &iconhd;
 	if (parser->model == ICONHDNET) {
 		headersize = 0x80;
 		samplesize = 12;
-	} else if (parser->model == QUADAIR || parser->model == SMARTAIR) {
+		layout = &iconhdnet;
+	} else if (parser->model == QUADAIR) {
 		headersize = 0x84;
 		samplesize = 12;
+		layout = &smartair;
 	} else if (parser->model == SMART) {
 		if (mode == ICONHD_FREEDIVE) {
 			headersize = 0x2E;
 			samplesize = 6;
+			layout = &smart_freedive;
 		} else {
 			headersize = 0x5C;
 			samplesize = 8;
+			layout = &iconhd;
 		}
 	} else if (parser->model == SMARTAPNEA) {
 		headersize = 0x50;
 		samplesize = 14;
+		layout = &smartapnea;
+	} else if (parser->model == SMARTAIR) {
+		if (mode == ICONHD_FREEDIVE) {
+			headersize = 0x30;
+			samplesize = 6;
+			layout = &smartair_freedive;
+		} else {
+			headersize = 0x84;
+			samplesize = 12;
+			layout = &smartair;
+		}
 	}
 
 	if (length < 4 + headersize) {
@@ -252,14 +397,7 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 	}
 
 	// Get the dive settings.
-	unsigned int settings = 0;
-	if (parser->model == SMARTAPNEA) {
-		settings = array_uint16_le (p + 0x1C);
-	} else if (parser->mode == ICONHD_FREEDIVE) {
-		settings = array_uint16_le (p + 0x08);
-	} else {
-		settings = array_uint16_le (p + 0x0C);
-	}
+	unsigned int settings = array_uint16_le (p + layout->settings);
 
 	// Get the sample interval.
 	unsigned int interval = 0;
@@ -277,7 +415,7 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 
 	// Calculate the total number of bytes for this dive.
 	unsigned int nbytes = 4 + headersize + nsamples * samplesize;
-	if (parser->model == ICONHDNET || parser->model == QUADAIR || parser->model == SMARTAIR) {
+	if (layout->tanks != UNSUPPORTED) {
 		nbytes += (nsamples / 4) * 8;
 	} else if (parser->model == SMARTAPNEA) {
 		unsigned int divetime = array_uint32_le (p + 0x24);
@@ -291,31 +429,34 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 	// Gas mixes
 	unsigned int ngasmixes = 0;
 	mares_iconhd_gasmix_t gasmix[NGASMIXES_ICONHD] = {0};
-	if (mode == ICONHD_GAUGE || mode == ICONHD_FREEDIVE) {
-		ngasmixes = 0;
-	} else if (mode == ICONHD_AIR) {
-		gasmix[0].oxygen = 21;
-		gasmix[0].helium = 0;
-		ngasmixes = 1;
-	} else {
-		// Count the number of active gas mixes. The active gas
-		// mixes are always first, so we stop counting as soon
-		// as the first gas marked as disabled is found.
-		ngasmixes = 0;
-		while (ngasmixes < NGASMIXES_ICONHD) {
-			if (p[0x10 + ngasmixes * 4 + 1] & 0x80)
-				break;
-			gasmix[ngasmixes].oxygen = p[0x10 + ngasmixes * 4];
-			gasmix[ngasmixes].helium = 0;
-			ngasmixes++;
+	if (layout->gasmixes != UNSUPPORTED) {
+		if (mode == ICONHD_GAUGE || mode == ICONHD_FREEDIVE) {
+			ngasmixes = 0;
+		} else if (mode == ICONHD_AIR) {
+			gasmix[0].oxygen = 21;
+			gasmix[0].helium = 0;
+			ngasmixes = 1;
+		} else {
+			// Count the number of active gas mixes. The active gas
+			// mixes are always first, so we stop counting as soon
+			// as the first gas marked as disabled is found.
+			ngasmixes = 0;
+			while (ngasmixes < NGASMIXES_ICONHD) {
+				unsigned int offset = layout->gasmixes + ngasmixes * 4;
+				if (p[offset + 1] & 0x80)
+					break;
+				gasmix[ngasmixes].oxygen = p[offset];
+				gasmix[ngasmixes].helium = 0;
+				ngasmixes++;
+			}
 		}
 	}
 
 	// Tanks
 	unsigned int ntanks = 0;
 	mares_iconhd_tank_t tank[NTANKS_ICONHD] = {0};
-	if (parser->model == ICONHDNET || parser->model == QUADAIR || parser->model == SMARTAIR) {
-		unsigned int tankoffset = (parser->model == ICONHDNET) ? 0x58 : 0x5C;
+	if (layout->tanks != UNSUPPORTED) {
+		unsigned int tankoffset = layout->tanks;
 		while (ntanks < NTANKS_ICONHD) {
 			tank[ntanks].volume        = array_uint16_le (p + tankoffset + 0x0C + ntanks * 8 + 0);
 			tank[ntanks].workpressure  = array_uint16_le (p + tankoffset + 0x0C + ntanks * 8 + 2);
@@ -331,11 +472,13 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 	parser->base.size = length;
 
 	// Cache the data for later use.
+	parser->logformat = 0;
 	parser->mode = mode;
 	parser->nsamples = nsamples;
 	parser->samplesize = samplesize;
 	parser->headersize = headersize;
 	parser->settings = settings;
+	parser->surftime = 3 * 60;
 	parser->interval = interval;
 	parser->samplerate = samplerate;
 	parser->ntanks = ntanks;
@@ -346,6 +489,7 @@ mares_iconhd_cache (mares_iconhd_parser_t *parser)
 	for (unsigned int i = 0; i < ntanks; ++i) {
 		parser->tank[i] = tank[i];
 	}
+	parser->layout = layout;
 	parser->cached = 1;
 
 	return DC_STATUS_SUCCESS;
@@ -358,42 +502,78 @@ mares_genius_cache (mares_iconhd_parser_t *parser)
 	const unsigned char *data = parser->base.data;
 	unsigned int size = parser->base.size;
 
-	if (size < 4) {
+	if (size < 20) {
 		ERROR (abstract->context, "Buffer overflow detected!");
 		return DC_STATUS_DATAFORMAT;
 	}
 
 	// Check the header type and version.
 	unsigned int type = array_uint16_le (data);
-	unsigned int major = data[2];
-	unsigned int minor = data[3];
-	if (type != 1 || major != 0 || minor != 0) {
+	unsigned int minor = data[2];
+	unsigned int major = data[3];
+	if (type != 1 || OBJVERSION(major,minor) > OBJVERSION(1,1)) {
 		ERROR (abstract->context, "Unsupported object type (%u) or version (%u.%u).",
 			type, major, minor);
 		return DC_STATUS_DATAFORMAT;
 	}
 
+	// Get the data format.
+	unsigned int logformat = data[0x10];
+
+	// The Horizon header has 8 bytes extra at offset 0x18.
+	unsigned int extra = 0;
+	const mares_iconhd_layout_t * layout = &genius;
+	if (logformat == 1) {
+		extra = 8;
+		layout = &horizon;
+	}
+
+	// The Genius header (v1.x) has 10 bytes more at the end.
+	unsigned int more = 0;
+	if (major == 1) {
+		more = 16;
+	}
+
 	// Get the header size.
-	unsigned int headersize = 0xB8;
+	unsigned int headersize = 0xB8 + extra + more;
 	if (headersize > size) {
 		ERROR (abstract->context, "Buffer overflow detected!");
 		return DC_STATUS_DATAFORMAT;
 	}
 
 	// Get the number of samples in the profile data.
-	unsigned int nsamples = array_uint16_le (data + 0x20);
+	unsigned int nsamples = array_uint16_le (data + 0x20 + extra);
 
 	// Get the dive settings.
-	unsigned int settings = array_uint32_le (data + 0x0C);
+	unsigned int settings = array_uint32_le (data + layout->settings);
 
 	// Get the dive mode.
 	unsigned int mode = settings & 0xF;
 
+	// Get the sample size.
+	unsigned int samplesize = logformat == 1 ? SDPT_SIZE: DPRS_SIZE;
+
 	// Calculate the total number of bytes for this dive.
-	unsigned int nbytes = headersize + 4 + DSTR_SIZE + TISS_SIZE + nsamples * DPRS_SIZE + (nsamples / 4) * AIRS_SIZE + DEND_SIZE;
+	unsigned int nbytes = headersize + 4 + DSTR_SIZE + TISS_SIZE + nsamples * samplesize + (nsamples / 4) * AIRS_SIZE + DEND_SIZE;
 	if (nbytes > size) {
 		ERROR (abstract->context, "Buffer overflow detected!");
 		return DC_STATUS_DATAFORMAT;
+	}
+
+	// Get the profile type and version.
+	unsigned int profile_type = array_uint16_le (data + headersize);
+	unsigned int profile_minor = data[headersize + 2];
+	unsigned int profile_major = data[headersize + 3];
+
+	// Get the surface timeout setting (in minutes).
+	// For older firmware versions the value is hardcoded to 3 minutes, but
+	// starting with the newer v01.02.00 firmware the value is configurable and
+	// stored in the settings. To detect whether the setting is available, we
+	// need to check the profile version instead of the header version.
+	unsigned int surftime = 3;
+	if (profile_type == 0 &&
+		OBJVERSION(profile_major,profile_minor) >= OBJVERSION(1,0)) {
+		surftime = (settings >> 13) & 0x3F;
 	}
 
 	// Gas mixes and tanks.
@@ -402,7 +582,7 @@ mares_genius_cache (mares_iconhd_parser_t *parser)
 	mares_iconhd_gasmix_t gasmix[NGASMIXES_GENIUS] = {0};
 	mares_iconhd_tank_t tank[NTANKS_GENIUS] = {0};
 	for (unsigned int i = 0; i < NGASMIXES_GENIUS; i++) {
-		unsigned int offset = 0x54 + i * 20;
+		unsigned int offset = layout->tanks + i * 20;
 		unsigned int gasmixparams  = array_uint32_le(data + offset + 0);
 		unsigned int beginpressure = array_uint16_le(data + offset + 4);
 		unsigned int endpressure   = array_uint16_le(data + offset + 6);
@@ -441,11 +621,13 @@ mares_genius_cache (mares_iconhd_parser_t *parser)
 	}
 
 	// Cache the data for later use.
+	parser->logformat = logformat;
 	parser->mode = mode;
 	parser->nsamples = nsamples;
-	parser->samplesize = DPRS_SIZE;
+	parser->samplesize = samplesize;
 	parser->headersize = headersize;
 	parser->settings = settings;
+	parser->surftime = surftime * 60;
 	parser->interval = 5;
 	parser->samplerate = 1;
 	parser->ntanks = ntanks;
@@ -456,6 +638,7 @@ mares_genius_cache (mares_iconhd_parser_t *parser)
 	for (unsigned int i = 0; i < ntanks; ++i) {
 		parser->tank[i] = tank[i];
 	}
+	parser->layout = layout;
 	parser->cached = 1;
 
 	return DC_STATUS_SUCCESS;
@@ -468,7 +651,7 @@ mares_iconhd_parser_cache (mares_iconhd_parser_t *parser)
 		return DC_STATUS_SUCCESS;
 	}
 
-	if (parser->model == GENIUS) {
+	if (parser->model == GENIUS || parser->model == HORIZON) {
 		return mares_genius_cache (parser);
 	} else {
 		return mares_iconhd_cache (parser);
@@ -476,7 +659,7 @@ mares_iconhd_parser_cache (mares_iconhd_parser_t *parser)
 }
 
 dc_status_t
-mares_iconhd_parser_create (dc_parser_t **out, dc_context_t *context, unsigned int model)
+mares_iconhd_parser_create (dc_parser_t **out, dc_context_t *context, unsigned int model, unsigned int serial)
 {
 	mares_iconhd_parser_t *parser = NULL;
 
@@ -493,15 +676,18 @@ mares_iconhd_parser_create (dc_parser_t **out, dc_context_t *context, unsigned i
 	// Set the default values.
 	parser->model = model;
 	parser->cached = 0;
-	parser->mode = (model == GENIUS) ? GENIUS_AIR : ICONHD_AIR;
+	parser->logformat = 0;
+	parser->mode = (model == GENIUS || model == HORIZON) ? GENIUS_AIR : ICONHD_AIR;
 	parser->nsamples = 0;
 	parser->samplesize = 0;
 	parser->headersize = 0;
 	parser->settings = 0;
+	parser->surftime = 0;
 	parser->interval = 0;
 	parser->samplerate = 0;
 	parser->ntanks = 0;
 	parser->ngasmixes = 0;
+	parser->serial = serial;
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->gasmix[i].oxygen = 0;
 		parser->gasmix[i].helium = 0;
@@ -512,6 +698,7 @@ mares_iconhd_parser_create (dc_parser_t **out, dc_context_t *context, unsigned i
 		parser->tank[i].beginpressure = 0;
 		parser->tank[i].endpressure = 0;
 	}
+	parser->layout = NULL;
 
 	*out = (dc_parser_t*) parser;
 
@@ -526,11 +713,13 @@ mares_iconhd_parser_set_data (dc_parser_t *abstract, const unsigned char *data, 
 
 	// Reset the cache.
 	parser->cached = 0;
-	parser->mode = (parser->model == GENIUS) ? GENIUS_AIR : ICONHD_AIR;
+	parser->logformat = 0;
+	parser->mode = (parser->model == GENIUS || parser->model == HORIZON) ? GENIUS_AIR : ICONHD_AIR;
 	parser->nsamples = 0;
 	parser->samplesize = 0;
 	parser->headersize = 0;
 	parser->settings = 0;
+	parser->surftime = 0;
 	parser->interval = 0;
 	parser->samplerate = 0;
 	parser->ntanks = 0;
@@ -545,6 +734,7 @@ mares_iconhd_parser_set_data (dc_parser_t *abstract, const unsigned char *data, 
 		parser->tank[i].beginpressure = 0;
 		parser->tank[i].endpressure = 0;
 	}
+	parser->layout = NULL;
 
 	return DC_STATUS_SUCCESS;
 }
@@ -562,7 +752,7 @@ mares_iconhd_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime
 
 	// Pointer to the header data.
 	const unsigned char *p = abstract->data;
-	if (parser->model != GENIUS) {
+	if (parser->model != GENIUS && parser->model != HORIZON) {
 		p += abstract->size - parser->headersize;
 		if (parser->model != SMART && parser->model != SMARTAPNEA && parser->model != SMARTAIR) {
 			p += 4;
@@ -570,18 +760,10 @@ mares_iconhd_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime
 	}
 
 	// Offset to the date/time field.
-	if (parser->model == GENIUS) {
-		p += 0x08;
-	} else if (parser->model == SMARTAPNEA) {
-		p += 0x40;
-	} else if (parser->mode == ICONHD_FREEDIVE) {
-		p += 0x20;
-	} else {
-		p += 2;
-	}
+	p += parser->layout->datetime;
 
 	if (datetime) {
-		if (parser->model == GENIUS) {
+		if (parser->model == GENIUS || parser->model == HORIZON) {
 			unsigned int timestamp = array_uint32_le (p);
 			datetime->hour   = (timestamp     ) & 0x1F;
 			datetime->minute = (timestamp >> 5) & 0x3F;
@@ -603,6 +785,7 @@ mares_iconhd_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime
 	return DC_STATUS_SUCCESS;
 }
 
+#define BUFLEN 16
 
 static dc_status_t
 mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value)
@@ -616,47 +799,39 @@ mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 
 	// Pointer to the header data.
 	const unsigned char *p = abstract->data;
-	if (parser->model != GENIUS) {
+	if (parser->model != GENIUS && parser->model != HORIZON) {
 		p += abstract->size - parser->headersize;
 		if (parser->model != SMART && parser->model != SMARTAPNEA && parser->model != SMARTAIR) {
 			p += 4;
 		}
 	}
 
-	unsigned int metric = parser->model == GENIUS ? p[0x34] : parser->settings & 0x0100;
+	// The Horizon header has 8 bytes extra at offset 0x18.
+	unsigned int extra = 0;
+	if (parser->logformat == 1) {
+		extra = 8;
+	}
+
+	unsigned int metric = (parser->model == GENIUS || parser->model == HORIZON) ?
+		p[0x34 + extra] : parser->settings & 0x0100;
 
 	dc_gasmix_t *gasmix = (dc_gasmix_t *) value;
 	dc_tank_t *tank = (dc_tank_t *) value;
 	dc_salinity_t *water = (dc_salinity_t *) value;
+	dc_field_string_t *string = (dc_field_string_t *) value;
+	char buf[BUFLEN];
 
 	if (value) {
 		switch (type) {
 		case DC_FIELD_DIVETIME:
-			if (parser->model == GENIUS) {
-				*((unsigned int *) value) = parser->nsamples * parser->interval;
-			} else if (parser->model == SMARTAPNEA) {
-				*((unsigned int *) value) = array_uint16_le (p + 0x24);
-			} else if (parser->mode == ICONHD_FREEDIVE) {
-				unsigned int divetime = 0;
-				unsigned int offset = 4;
-				for (unsigned int i = 0; i < parser->nsamples; ++i) {
-					divetime += array_uint16_le (abstract->data + offset + 2);
-					offset += parser->samplesize;
-				}
-				*((unsigned int *) value) = divetime;
+			if (parser->layout->divetime != UNSUPPORTED) {
+				*((unsigned int *) value) = array_uint16_le (p + parser->layout->divetime);
 			} else {
-				*((unsigned int *) value) = parser->nsamples * parser->interval;
+				*((unsigned int *) value) = parser->nsamples * parser->interval - parser->surftime;
 			}
 			break;
 		case DC_FIELD_MAXDEPTH:
-			if (parser->model == GENIUS)
-				*((double *) value) = array_uint16_le (p + 0x22) / 10.0;
-			else if (parser->model == SMARTAPNEA)
-				*((double *) value) = array_uint16_le (p + 0x3A) / 10.0;
-			else if (parser->mode == ICONHD_FREEDIVE)
-				*((double *) value) = array_uint16_le (p + 0x1A) / 10.0;
-			else
-				*((double *) value) = array_uint16_le (p + 0x00) / 10.0;
+			*((double *) value) = array_uint16_le (p + parser->layout->maxdepth) / 10.0;
 			break;
 		case DC_FIELD_GASMIX_COUNT:
 			*((unsigned int *) value) = parser->ngasmixes;
@@ -691,17 +866,10 @@ mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 			}
 			break;
 		case DC_FIELD_ATMOSPHERIC:
-			if (parser->model == GENIUS)
-				*((double *) value) = array_uint16_le (p + 0x3E) / 1000.0;
-			else if (parser->model == SMARTAPNEA)
-				*((double *) value) = array_uint16_le (p + 0x38) / 1000.0;
-			else if (parser->mode == ICONHD_FREEDIVE)
-				*((double *) value) = array_uint16_le (p + 0x18) / 1000.0;
-			else
-				*((double *) value) = array_uint16_le (p + 0x22) / 8000.0;
+			*((double *) value) = array_uint16_le (p + parser->layout->atmospheric) / (1000.0 * parser->layout->atmospheric_divisor);
 			break;
 		case DC_FIELD_SALINITY:
-			if (parser->model == GENIUS) {
+			if (parser->model == GENIUS || parser->model == HORIZON) {
 				unsigned int salinity = (parser->settings >> 5) & 0x03;
 				switch (salinity) {
 				case WATER_FRESH:
@@ -737,32 +905,19 @@ mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 			}
 			break;
 		case DC_FIELD_TEMPERATURE_MINIMUM:
-			if (parser->model == GENIUS)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x28) / 10.0;
-			else if (parser->model == SMARTAPNEA)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x3E) / 10.0;
-			else if (parser->mode == ICONHD_FREEDIVE)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x1C) / 10.0;
-			else
-				*((double *) value) = (signed short) array_uint16_le (p + 0x42) / 10.0;
+			*((double *) value) = (signed short) array_uint16_le (p + parser->layout->temperature_min) / 10.0;
 			break;
 		case DC_FIELD_TEMPERATURE_MAXIMUM:
-			if (parser->model == GENIUS)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x26) / 10.0;
-			else if (parser->model == SMARTAPNEA)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x3C) / 10.0;
-			else if (parser->mode == ICONHD_FREEDIVE)
-				*((double *) value) = (signed short) array_uint16_le (p + 0x1E) / 10.0;
-			else
-				*((double *) value) = (signed short) array_uint16_le (p + 0x44) / 10.0;
+			*((double *) value) = (signed short) array_uint16_le (p + parser->layout->temperature_max) / 10.0;
 			break;
 		case DC_FIELD_DIVEMODE:
-			if (parser->model == GENIUS) {
+			if (parser->model == GENIUS || parser->model == HORIZON) {
 				switch (parser->mode) {
 				case GENIUS_AIR:
 				case GENIUS_NITROX_SINGLE:
 				case GENIUS_NITROX_MULTI:
 				case GENIUS_TRIMIX:
+				case GENIUS_OC:
 					*((dc_divemode_t *) value) = DC_DIVEMODE_OC;
 					break;
 				case GENIUS_GAUGE:
@@ -770,6 +925,9 @@ mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 					break;
 				case GENIUS_FREEDIVE:
 					*((dc_divemode_t *) value) = DC_DIVEMODE_FREEDIVE;
+					break;
+				case GENIUS_SCR:
+					*((dc_divemode_t *) value) = DC_DIVEMODE_SCR;
 					break;
 				default:
 					return DC_STATUS_DATAFORMAT;
@@ -790,6 +948,17 @@ mares_iconhd_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsi
 					return DC_STATUS_DATAFORMAT;
 				}
 			}
+			break;
+		case DC_FIELD_STRING:
+			switch(flags) {
+			case 0: /* serial */
+				string->desc = "Serial";
+				snprintf(buf, BUFLEN, "%u", parser->serial);
+				break;
+			default:
+				return DC_STATUS_UNSUPPORTED;
+			}
+			string->value = strdup(buf);
 			break;
 		default:
 			return DC_STATUS_UNSUPPORTED;
@@ -823,19 +992,19 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 	// Previous gas mix - initialize with impossible value
 	unsigned int gasmix_previous = 0xFFFFFFFF;
 
-	unsigned int isairintegrated = (parser->model == ICONHDNET || parser->model == QUADAIR || parser->model == SMARTAIR || parser->model == GENIUS);
-
 	unsigned int offset = 4;
 	unsigned int marker = 0;
-	if (parser->model == GENIUS) {
+	if (parser->model == GENIUS || parser->model == HORIZON) {
 		// Skip the dive header.
 		data += parser->headersize;
 
 		// Check the profile type and version.
 		unsigned int type = array_uint16_le (data);
-		unsigned int major = data[2];
-		unsigned int minor = data[3];
-		if (type != 0 || major != 2 || minor != 0) {
+		unsigned int minor = data[2];
+		unsigned int major = data[3];
+		if (type > 1 ||
+			(type == 0 && OBJVERSION(major,minor) > OBJVERSION(1,0)) ||
+			(type == 1 && OBJVERSION(major,minor) > OBJVERSION(0,2))) {
 			ERROR (abstract->context, "Unsupported object type (%u) or version (%u.%u).",
 				type, major, minor);
 			return DC_STATUS_DATAFORMAT;
@@ -894,7 +1063,7 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 
 				offset += 2 * parser->samplerate;
 			}
-		} else if (parser->model != GENIUS && parser->mode == ICONHD_FREEDIVE) {
+		} else if (parser->model != GENIUS && parser->model != HORIZON && parser->mode == ICONHD_FREEDIVE) {
 			unsigned int maxdepth = array_uint16_le (data + offset + 0);
 			unsigned int divetime = array_uint16_le (data + offset + 2);
 			unsigned int surftime = array_uint16_le (data + offset + 4);
@@ -921,18 +1090,49 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 			nsamples++;
 		} else {
 			unsigned int depth = 0, temperature = 0;
-			unsigned int gasmix = 0, misc = 0, alarms = 0;
-			if (parser->model == GENIUS) {
-				if (!mares_genius_isvalid (data + offset, DPRS_SIZE, DPRS_TYPE)) {
-					ERROR (abstract->context, "Invalid DPRS record.");
-					return DC_STATUS_DATAFORMAT;
-				}
+			unsigned int gasmix = 0, alarms = 0;
+			unsigned int decostop = 0, decodepth = 0, decotime = 0, tts = 0;
+			unsigned int bookmark = 0;
+			if (parser->model == GENIUS || parser->model == HORIZON) {
+				if (parser->logformat == 1) {
+					if (!mares_genius_isvalid (data + offset, SDPT_SIZE, SDPT_TYPE)) {
+						ERROR (abstract->context, "Invalid SDPT record.");
+						return DC_STATUS_DATAFORMAT;
+					}
 
-				depth = array_uint16_le (data + offset + marker + 0);
-				temperature = array_uint16_le (data + offset + marker + 4);
-				alarms = array_uint32_le (data + offset + marker + 0x0C);
-				misc = array_uint32_le (data + offset + marker + 0x14);
-				gasmix = (misc >> 6) & 0xF;
+					unsigned int misc = 0, deco = 0;
+					depth       = array_uint16_le (data + offset + marker + 2);
+					temperature = array_uint16_le (data + offset + marker + 6);
+					alarms      = array_uint32_le (data + offset + marker + 0x14);
+					misc        = array_uint32_le (data + offset + marker + 0x18);
+					deco        = array_uint32_le (data + offset + marker + 0x1C);
+					bookmark    = (misc >>  2) & 0x0F;
+					gasmix      = (misc >>  6) & 0x0F;
+					decostop    = (misc >> 10) & 0x01;
+					if (decostop) {
+						decodepth = (deco >>  3) & 0x7F;
+						decotime  = (deco >> 10) & 0xFF;
+						tts       = (deco >> 18) & 0x3FFF;
+					} else {
+						decotime  = deco & 0xFF;
+					}
+				} else {
+					if (!mares_genius_isvalid (data + offset, DPRS_SIZE, DPRS_TYPE)) {
+						ERROR (abstract->context, "Invalid DPRS record.");
+						return DC_STATUS_DATAFORMAT;
+					}
+
+					unsigned int misc = 0;
+					depth       = array_uint16_le (data + offset + marker + 0);
+					temperature = array_uint16_le (data + offset + marker + 4);
+					decotime    = array_uint16_le (data + offset + marker + 0x0A);
+					alarms      = array_uint32_le (data + offset + marker + 0x0C);
+					misc        = array_uint32_le (data + offset + marker + 0x14);
+					bookmark    = (misc >>  2) & 0x0F;
+					gasmix      = (misc >>  6) & 0x0F;
+					decostop    = (misc >> 18) & 0x01;
+					decodepth   = (misc >> 19) & 0x7F;
+				}
 			} else {
 				depth = array_uint16_le (data + offset + 0);
 				temperature = array_uint16_le (data + offset + 2) & 0x0FFF;
@@ -965,10 +1165,17 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 				}
 			}
 
-			if (parser->model == GENIUS) {
+			// Bookmark
+			if (bookmark) {
+				sample.event.type = SAMPLE_EVENT_BOOKMARK;
+				sample.event.time = 0;
+				sample.event.flags = 0;
+				sample.event.value = bookmark;
+				if (callback) callback (DC_SAMPLE_EVENT, sample, userdata);
+			}
+
+			if (parser->model == GENIUS || parser->model == HORIZON) {
 				// Deco stop / NDL.
-				unsigned int decostop  = (misc >> 18) & 0x01;
-				unsigned int decodepth = (misc >> 19) & 0x7F;
 				if (decostop) {
 					sample.deco.type = DC_DECO_DECOSTOP;
 					sample.deco.depth = decodepth;
@@ -976,7 +1183,7 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 					sample.deco.type = DC_DECO_NDL;
 					sample.deco.depth = 0.0;
 				}
-				sample.deco.time = array_uint16_le (data + offset + marker + 0x0A) * 60;
+				sample.deco.time = decotime * 60;
 				if (callback) callback (DC_SAMPLE_DECO, sample, userdata);
 
 				// Alarms
@@ -1012,8 +1219,9 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 			nsamples++;
 
 			// Some extra data.
-			if (isairintegrated && (nsamples % 4) == 0) {
-				if (parser->model == GENIUS && !mares_genius_isvalid (data + offset, AIRS_SIZE, AIRS_TYPE)) {
+			if (parser->layout->tanks != UNSUPPORTED && (nsamples % 4) == 0) {
+				if ((parser->model == GENIUS || parser->model == HORIZON) &&
+					!mares_genius_isvalid (data + offset, AIRS_SIZE, AIRS_TYPE)) {
 					ERROR (abstract->context, "Invalid AIRS record.");
 					return DC_STATUS_DATAFORMAT;
 				}
@@ -1028,12 +1236,12 @@ mares_iconhd_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t
 					WARNING (abstract->context, "Invalid tank with non-zero pressure.");
 				}
 
-				offset += (parser->model == GENIUS) ? AIRS_SIZE : 8;
+				offset += (parser->model == GENIUS || parser->model == HORIZON) ? AIRS_SIZE : 8;
 			}
 		}
 	}
 
-	if (parser->model == GENIUS) {
+	if (parser->model == GENIUS || parser->model == HORIZON) {
 		// Skip the DEND record.
 		if (!mares_genius_isvalid (data + offset, DEND_SIZE, DEND_TYPE)) {
 			ERROR (abstract->context, "Invalid DEND record.");

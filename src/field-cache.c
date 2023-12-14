@@ -9,7 +9,7 @@
  * The field cache 'string' interface has some simple rules:
  * the "descriptor" part is assumed to be a static allocation,
  * while the "value" is something that this interface will
- * alway sallocate with 'strdup()', so you can generate it
+ * always allocate with 'strdup()', so you can generate it
  * dynamically on the stack or whatever without having to
  * worry about it.
  */
@@ -60,5 +60,60 @@ dc_status_t dc_field_get_string(dc_field_cache_t *cache, unsigned idx, dc_field_
 			return DC_STATUS_SUCCESS;
 		}
 	}
+	return DC_STATUS_UNSUPPORTED;
+}
+
+
+/*
+ * Use this generic "pick fields from the field cache" helper
+ * after you've handled all the ones you do differently
+ */
+dc_status_t
+dc_field_get(dc_field_cache_t *cache, dc_field_type_t type, unsigned int flags, void* value)
+{
+	if (!value)
+		return DC_STATUS_INVALIDARGS;
+
+	if (!(cache->initialized & (1 << type)))
+		return DC_STATUS_UNSUPPORTED;
+
+	switch (type) {
+	case DC_FIELD_DIVETIME:
+		return DC_FIELD_VALUE(*cache, value, DIVETIME);
+	case DC_FIELD_MAXDEPTH:
+		return DC_FIELD_VALUE(*cache, value, MAXDEPTH);
+	case DC_FIELD_AVGDEPTH:
+		return DC_FIELD_VALUE(*cache, value, AVGDEPTH);
+	case DC_FIELD_GASMIX_COUNT:
+	case DC_FIELD_TANK_COUNT:
+		return DC_FIELD_VALUE(*cache, value, GASMIX_COUNT);
+	case DC_FIELD_GASMIX:
+		if (flags >= MAXGASES)
+			break;
+		return DC_FIELD_INDEX(*cache, value, GASMIX, flags);
+	case DC_FIELD_SALINITY:
+		return DC_FIELD_VALUE(*cache, value, SALINITY);
+	case DC_FIELD_ATMOSPHERIC:
+		return DC_FIELD_VALUE(*cache, value, ATMOSPHERIC);
+	case DC_FIELD_DIVEMODE:
+		return DC_FIELD_VALUE(*cache, value, DIVEMODE);
+	case DC_FIELD_TANK:
+		if (flags >= MAXGASES)
+			break;
+
+		dc_tank_t *tank = (dc_tank_t *) value;
+
+		tank->volume = cache->tanksize[flags];
+		tank->gasmix = flags;
+		tank->workpressure = cache->tankworkingpressure[flags];
+		tank->type = cache->tankinfo[flags];
+
+		return DC_STATUS_SUCCESS;
+	case DC_FIELD_STRING:
+		return dc_field_get_string(cache, flags, (dc_field_string_t *)value);
+	default:
+		break;
+	}
+
 	return DC_STATUS_UNSUPPORTED;
 }

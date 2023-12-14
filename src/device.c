@@ -57,9 +57,17 @@
 #include "divesystem_idive.h"
 #include "cochran_commander.h"
 #include "tecdiving_divecomputereu.h"
-#include "garmin.h"
-#include "deepblu.h"
 #include "mclean_extreme.h"
+#include "liquivision_lynx.h"
+#include "sporasub_sp2.h"
+#include "deepsix_excursion.h"
+#include "seac_screen.h"
+#include "deepblu_cosmiq.h"
+#include "oceans_s1.h"
+#include "divesoft_freedom.h"
+
+// Not merged upstream yet
+#include "garmin.h"
 
 #include "device-private.h"
 #include "context-private.h"
@@ -191,7 +199,7 @@ dc_device_open (dc_device_t **out, dc_context_t *context, dc_descriptor_t *descr
 		rc = zeagle_n2ition3_device_open (&device, context, iostream);
 		break;
 	case DC_FAMILY_ATOMICS_COBALT:
-		rc = atomics_cobalt_device_open (&device, context);
+		rc = atomics_cobalt_device_open (&device, context, iostream);
 		break;
 	case DC_FAMILY_SHEARWATER_PREDATOR:
 		rc = shearwater_predator_device_open (&device, context, iostream);
@@ -214,17 +222,37 @@ dc_device_open (dc_device_t **out, dc_context_t *context, dc_descriptor_t *descr
 	case DC_FAMILY_TECDIVING_DIVECOMPUTEREU:
 		rc = tecdiving_divecomputereu_device_open (&device, context, iostream);
 		break;
-	case DC_FAMILY_GARMIN:
-		rc = garmin_device_open (&device, context, iostream);
-		break;
-	case DC_FAMILY_DEEPBLU:
-		rc = deepblu_device_open (&device, context, iostream);
-		break;
 	case DC_FAMILY_MCLEAN_EXTREME:
-		rc = mclean_extreme_device_open(&device, context, iostream);
+		rc = mclean_extreme_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_LIQUIVISION_LYNX:
+		rc = liquivision_lynx_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_SPORASUB_SP2:
+		rc = sporasub_sp2_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_DEEPSIX_EXCURSION:
+		rc = deepsix_excursion_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_SEAC_SCREEN:
+		rc = seac_screen_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_DEEPBLU_COSMIQ:
+		rc = deepblu_cosmiq_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_OCEANS_S1:
+		rc = oceans_s1_device_open (&device, context, iostream);
+		break;
+	case DC_FAMILY_DIVESOFT_FREEDOM:
+		rc = divesoft_freedom_device_open (&device, context, iostream);
 		break;
 	default:
 		return DC_STATUS_INVALIDARGS;
+
+	// Not merged upstream yet
+	case DC_FAMILY_GARMIN:
+		rc = garmin_device_open (&device, context, iostream, dc_descriptor_get_model (descriptor));
+		break;
 	}
 
 	*out = device;
@@ -338,7 +366,7 @@ dc_device_dump (dc_device_t *device, dc_buffer_t *buffer)
 
 
 dc_status_t
-device_dump_read (dc_device_t *device, unsigned char data[], unsigned int size, unsigned int blocksize)
+device_dump_read (dc_device_t *device, unsigned int address, unsigned char data[], unsigned int size, unsigned int blocksize)
 {
 	if (device == NULL)
 		return DC_STATUS_UNSUPPORTED;
@@ -359,7 +387,7 @@ device_dump_read (dc_device_t *device, unsigned char data[], unsigned int size, 
 			len = blocksize;
 
 		// Read the packet.
-		dc_status_t rc = device->vtable->read (device, nbytes, data + nbytes, len);
+		dc_status_t rc = device->vtable->read (device, address + nbytes, data + nbytes, len);
 		if (rc != DC_STATUS_SUCCESS)
 			return rc;
 
@@ -395,6 +423,9 @@ dc_device_timesync (dc_device_t *device, const dc_datetime_t *datetime)
 
 	if (device->vtable->timesync == NULL)
 		return DC_STATUS_UNSUPPORTED;
+
+	if (datetime == NULL)
+		return DC_STATUS_INVALIDARGS;
 
 	return device->vtable->timesync (device, datetime);
 }

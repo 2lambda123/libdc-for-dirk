@@ -161,6 +161,30 @@ array_convert_str2num (const unsigned char data[], unsigned int size)
 }
 
 unsigned int
+array_convert_bin2dec (const unsigned char data[], unsigned int size)
+{
+	unsigned int value = 0;
+	for (unsigned int i = 0; i < size; ++i) {
+		value *= 100;
+		value += data[i];
+	}
+
+	return value;
+}
+
+unsigned int
+array_convert_bcd2dec (const unsigned char data[], unsigned int size)
+{
+	unsigned int value = 0;
+	for (unsigned int i = 0; i < size; ++i) {
+		value *= 100;
+		value += bcd2dec(data[i]);
+	}
+
+	return value;
+}
+
+unsigned int
 array_uint_be (const unsigned char data[], unsigned int n)
 {
 	unsigned int shift = n * 8;
@@ -182,6 +206,32 @@ array_uint_le (const unsigned char data[], unsigned int n)
 		shift += 8;
 	}
 	return value;
+}
+
+unsigned long long
+array_uint64_be (const unsigned char data[])
+{
+	return ((unsigned long long) data[0] << 56) |
+	       ((unsigned long long) data[1] << 48) |
+	       ((unsigned long long) data[2] << 40) |
+	       ((unsigned long long) data[3] << 32) |
+	       ((unsigned long long) data[4] << 24) |
+	       ((unsigned long long) data[5] << 16) |
+	       ((unsigned long long) data[6] <<  8) |
+	       ((unsigned long long) data[7] <<  0);
+}
+
+unsigned long long
+array_uint64_le (const unsigned char data[])
+{
+	return ((unsigned long long) data[0] <<  0) |
+	       ((unsigned long long) data[1] <<  8) |
+	       ((unsigned long long) data[2] << 16) |
+	       ((unsigned long long) data[3] << 24) |
+	       ((unsigned long long) data[4] << 32) |
+	       ((unsigned long long) data[5] << 40) |
+	       ((unsigned long long) data[6] << 48) |
+	       ((unsigned long long) data[7] << 56);
 }
 
 unsigned int
@@ -213,17 +263,6 @@ array_uint32_word_be (const unsigned char data[])
 	       ((unsigned int) data[3] << 16);
 }
 
-
-void
-array_uint32_le_set (unsigned char data[], const unsigned int input)
-{
-	data[0] = input & 0xFF;
-	data[1] = (input >>  8) & 0xFF;
-	data[2] = (input >> 16) & 0xFF;
-	data[3] = (input >> 24) & 0xFF;
-}
-
-
 unsigned int
 array_uint24_be (const unsigned char data[])
 {
@@ -231,16 +270,6 @@ array_uint24_be (const unsigned char data[])
 	       ((unsigned int) data[1] <<  8) |
 	       ((unsigned int) data[2] <<  0);
 }
-
-
-void
-array_uint24_be_set (unsigned char data[], const unsigned int input)
-{
-	data[0] = (input >> 16) & 0xFF;
-	data[1] = (input >>  8) & 0xFF;
-	data[2] = input & 0xFF;
-}
-
 
 unsigned int
 array_uint24_le (const unsigned char data[])
@@ -265,8 +294,113 @@ array_uint16_le (const unsigned char data[])
 	       ((unsigned int) data[1] <<  8);
 }
 
+void
+array_uint64_be_set (unsigned char data[], const unsigned long long input)
+{
+	data[0] = (input >> 56) & 0xFF;
+	data[1] = (input >> 48) & 0xFF;
+	data[2] = (input >> 40) & 0xFF;
+	data[3] = (input >> 32) & 0xFF;
+	data[4] = (input >> 24) & 0xFF;
+	data[5] = (input >> 16) & 0xFF;
+	data[6] = (input >>  8) & 0xFF;
+	data[7] = (input      ) & 0xFF;
+}
+
+void
+array_uint64_le_set (unsigned char data[], const unsigned long long input)
+{
+	data[0] = (input      ) & 0xFF;
+	data[1] = (input >>  8) & 0xFF;
+	data[2] = (input >> 16) & 0xFF;
+	data[3] = (input >> 24) & 0xFF;
+	data[4] = (input >> 32) & 0xFF;
+	data[5] = (input >> 40) & 0xFF;
+	data[6] = (input >> 48) & 0xFF;
+	data[7] = (input >> 56) & 0xFF;
+}
+
+void
+array_uint32_be_set (unsigned char data[], const unsigned int input)
+{
+	data[0] = (input >> 24) & 0xFF;
+	data[1] = (input >> 16) & 0xFF;
+	data[2] = (input >>  8) & 0xFF;
+	data[3] = (input      ) & 0xFF;
+}
+
+void
+array_uint32_le_set (unsigned char data[], const unsigned int input)
+{
+	data[0] = (input      ) & 0xFF;
+	data[1] = (input >>  8) & 0xFF;
+	data[2] = (input >> 16) & 0xFF;
+	data[3] = (input >> 24) & 0xFF;
+}
+
+void
+array_uint24_be_set (unsigned char data[], const unsigned int input)
+{
+	data[0] = (input >> 16) & 0xFF;
+	data[1] = (input >>  8) & 0xFF;
+	data[2] = (input      ) & 0xFF;
+}
+
+void
+array_uint24_le_set (unsigned char data[], const unsigned int input)
+{
+	data[0] = (input      ) & 0xFF;
+	data[1] = (input >>  8) & 0xFF;
+	data[2] = (input >> 16) & 0xFF;
+}
+
+void
+array_uint16_be_set (unsigned char data[], const unsigned short input)
+{
+	data[0] = (input >>  8) & 0xFF;
+	data[1] = (input      ) & 0xFF;
+}
+
+void
+array_uint16_le_set (unsigned char data[], const unsigned short input)
+{
+	data[0] = (input      ) & 0xFF;
+	data[1] = (input >>  8) & 0xFF;
+}
+
 unsigned char
 bcd2dec (unsigned char value)
 {
 	return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+}
+
+unsigned char
+dec2bcd (unsigned char value)
+{
+	if (value >= 100)
+		return 0;
+
+	unsigned char hi = value / 10;
+	unsigned char lo = value % 10;
+	return (hi << 4) | lo;
+}
+
+/*
+ * When turning a two's-complement number with a certain number
+ * of bits into one with more bits, the sign bit must be repeated
+ * in all the extra bits.
+ */
+unsigned int
+signextend (unsigned int value, unsigned int nbits)
+{
+	if (nbits <= 0 || nbits > 32)
+		return 0;
+
+	unsigned int signbit = 1U << (nbits - 1);
+	unsigned int mask = signbit - 1;
+
+	if ((value & signbit) == signbit)
+		return value | ~mask;
+	else
+		return value & mask;
 }

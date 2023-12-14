@@ -31,13 +31,14 @@
 
 #define ISINSTANCE(device) dc_device_isinstance((device), &uwatec_smart_device_vtable)
 
-#define C_ARRAY_SIZE(array) (sizeof (array) / sizeof *(array))
-
 #define DATASIZE 254
+#define MAX_PACKETSIZE 256
 #define PACKETSIZE_USBHID_RX 64
 #define PACKETSIZE_USBHID_TX 32
 
 #define CMD_MODEL      0x10
+#define CMD_HARDWARE   0x11
+#define CMD_SOFTWARE   0x13
 #define CMD_SERIAL     0x14
 #define CMD_DEVTIME    0x1A
 #define CMD_HANDSHAKE1 0x1B
@@ -275,9 +276,13 @@ uwatec_smart_usbhid_send (uwatec_smart_device_t *device, unsigned char cmd, cons
 {
 	dc_status_t rc = DC_STATUS_SUCCESS;
 	dc_device_t *abstract = (dc_device_t *) device;
-	unsigned char buf[PACKETSIZE_USBHID_TX + 1];
+	dc_transport_t transport = dc_iostream_get_transport(device->iostream);
+	unsigned char buf[DATASIZE + 3];
 
-	if (size + 3 > sizeof(buf)) {
+	size_t packetsize = transport == DC_TRANSPORT_USBHID ?
+		PACKETSIZE_USBHID_TX + 1 : sizeof(buf);
+
+	if (size > DATASIZE || size + 3 > packetsize) {
 		ERROR (abstract->context, "Command too large (" DC_PRINTF_SIZE ").", size);
 		return DC_STATUS_INVALIDARGS;
 	}
@@ -295,7 +300,7 @@ uwatec_smart_usbhid_send (uwatec_smart_device_t *device, unsigned char cmd, cons
 	if (dc_iostream_get_transport(device->iostream) == DC_TRANSPORT_BLE) {
 		rc = dc_iostream_write(device->iostream, buf + 1, size + 2, NULL);
 	} else {
-		rc = dc_iostream_write(device->iostream, buf, sizeof(buf), NULL);
+		rc = dc_iostream_write(device->iostream, buf, packetsize, NULL);
 	}
 	if (rc != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to send the command.");
@@ -310,12 +315,16 @@ uwatec_smart_usbhid_receive (uwatec_smart_device_t *device, dc_event_progress_t 
 {
 	dc_status_t rc = DC_STATUS_SUCCESS;
 	dc_device_t *abstract = (dc_device_t *) device;
-	unsigned char buf[PACKETSIZE_USBHID_RX];
+	dc_transport_t transport = dc_iostream_get_transport(device->iostream);
+	unsigned char buf[DATASIZE + 1];
+
+	size_t packetsize = transport == DC_TRANSPORT_USBHID ?
+		PACKETSIZE_USBHID_RX : sizeof(buf);
 
 	size_t nbytes = 0;
 	while (nbytes < size) {
 		size_t transferred = 0;
-		rc = dc_iostream_read (device->iostream, buf, sizeof(buf), &transferred);
+		rc = dc_iostream_read (device->iostream, buf, packetsize, &transferred);
 		if (rc != DC_STATUS_SUCCESS) {
 			ERROR (abstract->context, "Failed to receive the packet.");
 			return rc;
@@ -364,9 +373,11 @@ uwatec_smart_usbhid_receive (uwatec_smart_device_t *device, dc_event_progress_t 
 		 *
 		 * It may be just an oddly implemented sequence number. Whatever.
 		 */
-		unsigned int len = buf[0];
-		if (len + 1 > transferred)
-			len = transferred-1;
+		unsigned int len = transferred - 1;
+		if (transport == DC_TRANSPORT_USBHID) {
+			if (len > buf[0])
+				len = buf[0];
+		}
 
 		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "rcv", buf + 1, len);
 
@@ -477,8 +488,8 @@ uwatec_smart_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_
 		goto error_free;
 	}
 
-	// Set the timeout for receiving data (3000ms).
-	status  = dc_iostream_set_timeout (device->iostream, 3000);
+	// Set the timeout for receiving data (5000ms).
+	status  = dc_iostream_set_timeout (device->iostream, 5000);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
 		goto error_free;
@@ -559,6 +570,18 @@ uwatec_smart_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 	if (rc != DC_STATUS_SUCCESS)
 		return rc;
 
+	// Read the hardware version.
+	unsigned char hardware[1] = {0};
+	rc = uwatec_smart_transfer (device, CMD_HARDWARE, NULL, 0, hardware, sizeof (hardware));
+	if (rc != DC_STATUS_SUCCESS)
+		return rc;
+
+	// Read the software version.
+	unsigned char software[1] = {0};
+	rc = uwatec_smart_transfer (device, CMD_SOFTWARE, NULL, 0, software, sizeof (software));
+	if (rc != DC_STATUS_SUCCESS)
+		return rc;
+
 	// Read the serial number.
 	unsigned char serial[4] = {0};
 	rc = uwatec_smart_transfer (device, CMD_SERIAL, NULL, 0, serial, sizeof (serial));
@@ -576,7 +599,7 @@ uwatec_smart_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 	device->devtime = array_uint32_le (devtime);
 
 	// Update and emit a progress event.
-	progress.current += 9;
+	progress.current += 11;
 	device_event_emit (&device->base, DC_EVENT_PROGRESS, &progress);
 
 	// Emit a clock event.
@@ -588,7 +611,7 @@ uwatec_smart_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 	// Emit a device info event.
 	dc_event_devinfo_t devinfo;
 	devinfo.model = model[0];
-	devinfo.firmware = 0;
+	devinfo.firmware = bcd2dec (software[0]);
 	devinfo.serial = array_uint32_le (serial);
 	device_event_emit (&device->base, DC_EVENT_DEVINFO, &devinfo);
 
@@ -612,7 +635,7 @@ uwatec_smart_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 	unsigned int length = array_uint32_le (answer);
 
 	// Update and emit a progress event.
-	progress.maximum = 4 + 9 + (length ? length + 4 : 0);
+	progress.maximum = 4 + 11 + (length ? length + 4 : 0);
 	progress.current += 4;
 	device_event_emit (&device->base, DC_EVENT_PROGRESS, &progress);
 

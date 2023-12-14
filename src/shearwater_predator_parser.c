@@ -20,6 +20,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <libdivecomputer/units.h>
 
@@ -53,7 +54,10 @@
 #define LOG_RECORD_CLOSING_6       0x26
 #define LOG_RECORD_CLOSING_7       0x27
 #define LOG_RECORD_INFO_EVENT      0x30
+#define LOG_RECORD_DIVE_SAMPLE_EXT 0xE1
 #define LOG_RECORD_FINAL           0xFF
+
+#define INFO_EVENT_TAG_LOG         38
 
 #define SZ_BLOCK   0x80
 #define SZ_SAMPLE_PREDATOR  0x10
@@ -66,18 +70,36 @@
 #define SC            0x08
 #define OC            0x10
 
+#define M_CC       0
+#define M_OC_TEC   1
+#define M_GAUGE    2
+#define M_PPO2     3
+#define M_SC       4
+#define M_CC2      5
+#define M_OC_REC   6
+#define M_FREEDIVE 7
+
+#define AI_OFF   0
+#define AI_HPCCR 4
+#define AI_ON    5
+
+#define GF       0
+#define VPMB     1
+#define VPMB_GFS 2
+#define DCIEM    3
+
 #define METRIC   0
 #define IMPERIAL 1
 
-#define NGASMIXES 10
-#define MAXSTRINGS 32
-#define NTANKS    2
+#define NGASMIXES 20
+#define NFIXED    10
+#define NTANKS    6
 #define NRECORDS  8
+#define MAXSTRINGS 32
 
 #define PREDATOR 2
 #define PETREL   3
-
-#define INFO_EVENT_TAG_LOG 38
+#define TERIC    8
 
 #define UNDEFINED 0xFFFFFFFF
 
@@ -86,12 +108,18 @@ typedef struct shearwater_predator_parser_t shearwater_predator_parser_t;
 typedef struct shearwater_predator_gasmix_t {
 	unsigned int oxygen;
 	unsigned int helium;
+	unsigned int diluent;
 } shearwater_predator_gasmix_t;
 
 typedef struct shearwater_predator_tank_t {
 	unsigned int enabled;
+	unsigned int active;
 	unsigned int beginpressure;
 	unsigned int endpressure;
+	unsigned int pressure_max;
+	unsigned int pressure_reserve;
+	unsigned int serial;
+	char name[2];
 	unsigned int battery;
 } shearwater_predator_tank_t;
 
@@ -114,6 +142,7 @@ struct shearwater_predator_parser_t {
 	shearwater_predator_gasmix_t gasmix[NGASMIXES];
 	shearwater_predator_tank_t tank[NTANKS];
 	unsigned int tankidx[NTANKS];
+	unsigned int aimode;
 	unsigned int calibrated;
 	double calibration[3];
 	unsigned int serial;
@@ -136,6 +165,9 @@ static const dc_parser_vtable_t shearwater_predator_parser_vtable = {
 	sizeof(shearwater_predator_parser_t),
 	DC_FAMILY_SHEARWATER_PREDATOR,
 	shearwater_predator_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	shearwater_predator_parser_get_datetime, /* datetime */
 	shearwater_predator_parser_get_field, /* fields */
 	shearwater_predator_parser_samples_foreach, /* samples_foreach */
@@ -146,6 +178,9 @@ static const dc_parser_vtable_t shearwater_petrel_parser_vtable = {
 	sizeof(shearwater_predator_parser_t),
 	DC_FAMILY_SHEARWATER_PETREL,
 	shearwater_predator_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	shearwater_predator_parser_get_datetime, /* datetime */
 	shearwater_predator_parser_get_field, /* fields */
 	shearwater_predator_parser_samples_foreach, /* samples_foreach */
@@ -154,11 +189,11 @@ static const dc_parser_vtable_t shearwater_petrel_parser_vtable = {
 
 
 static unsigned int
-shearwater_predator_find_gasmix (shearwater_predator_parser_t *parser, unsigned int o2, unsigned int he)
+shearwater_predator_find_gasmix (shearwater_predator_parser_t *parser, unsigned int o2, unsigned int he, unsigned int dil)
 {
 	unsigned int i = 0;
 	while (i < parser->ngasmixes) {
-		if (o2 == parser->gasmix[i].oxygen && he == parser->gasmix[i].helium)
+		if (o2 == parser->gasmix[i].oxygen && he == parser->gasmix[i].helium && dil == parser->gasmix[i].diluent)
 			break;
 		i++;
 	}
@@ -213,22 +248,29 @@ shearwater_common_parser_create (dc_parser_t **out, dc_context_t *context, unsig
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->gasmix[i].oxygen = 0;
 		parser->gasmix[i].helium = 0;
+		parser->gasmix[i].diluent = 0;
 	}
 	parser->ntanks = 0;
 	for (unsigned int i = 0; i < NTANKS; ++i) {
 		parser->tank[i].enabled = 0;
+		parser->tank[i].active = 0;
 		parser->tank[i].beginpressure = 0;
 		parser->tank[i].endpressure = 0;
+		parser->tank[i].pressure_max = 0;
+		parser->tank[i].pressure_reserve = 0;
+		parser->tank[i].serial = 0;
+		memset (parser->tank[i].name, 0, sizeof (parser->tank[i].name));
 		parser->tank[i].battery = 0;
 		parser->tankidx[i] = i;
 	}
+	parser->aimode = AI_OFF;
 	parser->calibrated = 0;
 	for (unsigned int i = 0; i < 3; ++i) {
 		parser->calibration[i] = 0.0;
 	}
 	parser->units = METRIC;
-	parser->density = 1025;
-	parser->atmospheric = ATM / (BAR / 1000);
+	parser->density = DEF_DENSITY_SALT;
+	parser->atmospheric = DEF_ATMOSPHERIC / (BAR / 1000);
 
 	DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_OC);
 
@@ -272,21 +314,28 @@ shearwater_predator_parser_set_data (dc_parser_t *abstract, const unsigned char 
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->gasmix[i].oxygen = 0;
 		parser->gasmix[i].helium = 0;
+		parser->gasmix[i].diluent = 0;
 	}
 	parser->ntanks = 0;
 	for (unsigned int i = 0; i < NTANKS; ++i) {
 		parser->tank[i].enabled = 0;
+		parser->tank[i].active = 0;
 		parser->tank[i].beginpressure = 0;
 		parser->tank[i].endpressure = 0;
+		parser->tank[i].pressure_max = 0;
+		parser->tank[i].pressure_reserve = 0;
+		parser->tank[i].serial = 0;
+		memset (parser->tank[i].name, 0, sizeof (parser->tank[i].name));
 		parser->tankidx[i] = i;
 	}
+	parser->aimode = AI_OFF;
 	parser->calibrated = 0;
 	for (unsigned int i = 0; i < 3; ++i) {
 		parser->calibration[i] = 0.0;
 	}
 	parser->units = METRIC;
-	parser->density = 1025;
-	parser->atmospheric = ATM / (BAR / 1000);
+	parser->density = DEF_DENSITY_SALT;
+	parser->atmospheric = DEF_ATMOSPHERIC / (BAR / 1000);
 
 	DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_OC);
 
@@ -310,7 +359,13 @@ shearwater_predator_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *d
 	if (!dc_datetime_gmtime (datetime, ticks))
 		return DC_STATUS_DATAFORMAT;
 
-	datetime->timezone = DC_TIMEZONE_NONE;
+	if (parser->model == TERIC && parser->logversion >= 9 && parser->opening[5] != UNDEFINED) {
+		int utc_offset = (int) array_uint32_be (data + parser->opening[5] + 26);
+		int dst = data[parser->opening[5] + 30];
+		datetime->timezone = utc_offset * 60 + dst * 3600;
+	} else {
+		datetime->timezone = DC_TIMEZONE_NONE;
+	}
 
 	return DC_STATUS_SUCCESS;
 }
@@ -400,6 +455,7 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 	dc_parser_t *abstract = (dc_parser_t *) parser;
 	const unsigned char *data = parser->base.data;
 	unsigned int size = parser->base.size;
+	const char *ppo2_source = NULL;
 
 	if (parser->cached) {
 		return DC_STATUS_SUCCESS;
@@ -448,7 +504,7 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 		// byte opening and closing block. To minimize the differences
 		// with the PNF format, all record offsets are assigned the same
 		// value here.
-		for (unsigned int i = 0; i < NRECORDS; ++i) {
+		for (unsigned int i = 0; i <= 4; ++i) {
 			parser->opening[i] = 0;
 			parser->closing[i] = size - footersize;
 		}
@@ -458,13 +514,21 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 	}
 
 	// Default dive mode.
-	dc_divemode_t mode = DC_DIVEMODE_OC;
+	unsigned int divemode = M_OC_TEC;
 
 	// Get the gas mixes.
-	unsigned int ngasmixes = 0;
+	unsigned int ngasmixes = NFIXED;
 	shearwater_predator_gasmix_t gasmix[NGASMIXES] = {0};
 	shearwater_predator_tank_t tank[NTANKS] = {0};
-	unsigned int o2_previous = 0, he_previous = 0;
+	unsigned int o2_previous = UNDEFINED, he_previous = UNDEFINED, dil_previous = UNDEFINED;
+	unsigned int aimode = AI_OFF;
+	if (!pnf) {
+		for (unsigned int i = 0; i < NFIXED; ++i) {
+			gasmix[i].oxygen = data[20 + i];
+			gasmix[i].helium = data[30 + i];
+			gasmix[i].diluent = i >= 5;
+		}
+	}
 
 	unsigned int offset = headersize;
 	unsigned int length = size - footersize;
@@ -481,18 +545,20 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 		if (type == LOG_RECORD_DIVE_SAMPLE) {
 			// Status flags.
 			unsigned int status = data[offset + 11 + pnf];
-			if ((status & OC) == 0) {
-				mode = DC_DIVEMODE_CCR;
+			unsigned int ccr = (status & OC) == 0;
+			if (ccr) {
+				divemode = status & SC ? M_SC : M_CC;
 			}
 
 			// Gaschange.
 			unsigned int o2 = data[offset + 7 + pnf];
 			unsigned int he = data[offset + 8 + pnf];
-			if (o2 != o2_previous || he != he_previous) {
+			if ((o2 != o2_previous || he != he_previous || ccr != dil_previous) &&
+				(o2 != 0 || he != 0)) {
 				// Find the gasmix in the list.
 				unsigned int idx = 0;
 				while (idx < ngasmixes) {
-					if (o2 == gasmix[idx].oxygen && he == gasmix[idx].helium)
+					if (o2 == gasmix[idx].oxygen && he == gasmix[idx].helium && ccr == gasmix[idx].diluent)
 						break;
 					idx++;
 				}
@@ -505,17 +571,19 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 					}
 					gasmix[idx].oxygen = o2;
 					gasmix[idx].helium = he;
+					gasmix[idx].diluent = ccr;
 					ngasmixes = idx + 1;
 				}
 
 				o2_previous = o2;
 				he_previous = he;
+				dil_previous = ccr;
 			}
 
 			// Tank pressure
 			if (logversion >= 7) {
-				const unsigned int idx[NTANKS] = {27, 19};
-				for (unsigned int i = 0; i < NTANKS; ++i) {
+				const unsigned int idx[2] = {27, 19};
+				for (unsigned int i = 0; i < 2; ++i) {
 					// Values above 0xFFF0 are special codes:
 					//    0xFFFF AI is off
 					//    0xFFFE No comms for 90 seconds+
@@ -525,30 +593,133 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 					// level (0=normal, 1=critical, 2=warning), and the lower 12
 					// bits the tank pressure in units of 2 psi.
 					unsigned int pressure = array_uint16_be (data + offset + pnf + idx[i]);
+					unsigned int id = (aimode == AI_HPCCR ? 4 : 0) + i;
 					if (pressure < 0xFFF0) {
 						unsigned int battery = 1u << (pressure >> 12);
 						pressure &= 0x0FFF;
-						if (!tank[i].enabled) {
-							tank[i].enabled = 1;
-							tank[i].beginpressure = pressure;
-							tank[i].endpressure = pressure;
-							tank[i].battery = 0;
+						if (!tank[id].active) {
+							tank[id].active = 1;
+							tank[id].beginpressure = pressure;
+							tank[id].endpressure = pressure;
+							tank[id].battery = 0;
 						}
-						tank[i].endpressure = pressure;
-						tank[i].battery |= battery;
+						tank[id].endpressure = pressure;
+						tank[id].battery |= battery;
+					}
+				}
+			}
+		} else if (type == LOG_RECORD_DIVE_SAMPLE_EXT) {
+			// Tank pressure
+			if (logversion >= 13) {
+				for (unsigned int i = 0; i < 2; ++i) {
+					unsigned int pressure = array_uint16_be (data + offset + pnf + i * 2);
+					unsigned int id = 2 + i;
+					if (pressure < 0xFFF0) {
+						pressure &= 0x0FFF;
+						if (!tank[id].active) {
+							tank[id].active = 1;
+							tank[id].beginpressure = pressure;
+							tank[id].endpressure = pressure;
+						}
+						tank[id].endpressure = pressure;
+					}
+				}
+			}
+			// Tank pressure (HP CCR)
+			if (logversion >= 14) {
+				for (unsigned int i = 0; i < 2; ++i) {
+					unsigned int pressure = array_uint16_be (data + offset + pnf + 4 + i * 2);
+					unsigned int id = 4 + i;
+					if (pressure) {
+						if (!tank[id].active) {
+							tank[id].active = 1;
+							tank[id].enabled = 1;
+							tank[id].beginpressure = pressure;
+							tank[id].endpressure = pressure;
+							tank[id].name[0] = i == 0 ? 'D': 'O';
+							tank[id].name[1] = 0;
+						}
+						tank[id].endpressure = pressure;
 					}
 				}
 			}
 		} else if (type == LOG_RECORD_FREEDIVE_SAMPLE) {
 			// Freedive record
-			mode = DC_DIVEMODE_FREEDIVE;
+			divemode = M_FREEDIVE;
 		} else if (type >= LOG_RECORD_OPENING_0 && type <= LOG_RECORD_OPENING_7) {
 			// Opening record
 			parser->opening[type - LOG_RECORD_OPENING_0] = offset;
 
-			// Log version
-			if (type == LOG_RECORD_OPENING_4) {
+			if (type == LOG_RECORD_OPENING_0) {
+				for (unsigned int i = 0; i < NFIXED; ++i) {
+					gasmix[i].oxygen = data[offset + 20 + i];
+					gasmix[i].diluent = i >= 5;
+				}
+				for (unsigned int i = 0; i < 2; ++i) {
+					gasmix[i].helium = data[offset + 30 + i];
+				}
+			} else if (type == LOG_RECORD_OPENING_1) {
+				for (unsigned int i = 2; i < NFIXED; ++i) {
+					gasmix[i].helium = data[offset + 1 + i - 2];
+				}
+			} else if (type == LOG_RECORD_OPENING_4) {
+				// Log version
 				logversion = data[offset + 16];
+
+				// Air integration mode
+				if (logversion >= 7) {
+					aimode = data[offset + 28];
+					if (logversion < 13) {
+						if (aimode == 1 || aimode == 2) {
+							tank[aimode - 1].enabled = 1;
+						} else if (aimode == 3) {
+							tank[0].enabled = 1;
+							tank[1].enabled = 1;
+						}
+					}
+					if (logversion < 14) {
+						if (aimode == AI_HPCCR) {
+							for (unsigned int i = 0; i < 2; ++i) {
+								tank[4 + i].enabled = 1;
+								tank[4 + i].name[0] = i == 0 ? 'D': 'O';
+								tank[4 + i].name[1] = 0;
+							}
+						}
+					}
+				}
+			} else if (type == LOG_RECORD_OPENING_5) {
+				if (logversion >= 9) {
+					tank[0].serial = array_convert_bcd2dec (data + offset + 1, 3);
+					tank[0].pressure_max = array_uint16_be(data + offset + 6);
+					tank[0].pressure_reserve = array_uint16_be(data + offset + 8);
+
+					tank[1].serial = array_convert_bcd2dec(data + offset + 10, 3);
+					tank[1].pressure_max = array_uint16_be(data + offset + 15);
+					tank[1].pressure_reserve = array_uint16_be(data + offset + 17);
+				}
+			} else if (type == LOG_RECORD_OPENING_6) {
+				if (logversion >= 13) {
+					tank[0].enabled = data[offset + 19];
+					memcpy (tank[0].name, data + offset + 20, sizeof (tank[0].name));
+
+					tank[1].enabled = data[offset + 22];
+					memcpy (tank[1].name, data + offset + 23, sizeof (tank[1].name));
+
+					tank[2].serial = array_convert_bcd2dec(data + offset + 25, 3);
+					tank[2].pressure_max = array_uint16_be(data + offset + 28);
+					tank[2].pressure_reserve = array_uint16_be(data + offset + 30);
+				}
+			} else if (type == LOG_RECORD_OPENING_7) {
+				if (logversion >= 13) {
+					tank[2].enabled =  data[offset + 1];
+					memcpy (tank[2].name, data + offset + 2, sizeof (tank[2].name));
+
+					tank[3].serial = array_convert_bcd2dec(data + offset + 4, 3);
+					tank[3].pressure_max = array_uint16_be(data + offset + 7);
+					tank[3].pressure_reserve = array_uint16_be(data + offset + 9);
+					tank[3].enabled = data[offset + 11];
+					memcpy (tank[3].name, data + offset + 12, sizeof (tank[3].name));
+				}
 			}
 		} else if (type >= LOG_RECORD_CLOSING_0 && type <= LOG_RECORD_CLOSING_7) {
 			// Closing record
@@ -562,7 +733,10 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 	}
 
 	// Verify the required opening/closing records.
-	for (unsigned int i = 0; i < NRECORDS - 2; ++i) {
+	// At least in firmware v71 and newer, Petrel and Petrel 2 also use PNF,
+	// and there opening/closing record 5 (which contains AI information plus
+	// the sample interval) don't appear to exist - so don't mark them as required
+	for (unsigned int i = 0; i <= 4; ++i) {
 		if (parser->opening[i] == UNDEFINED || parser->closing[i] == UNDEFINED) {
 			ERROR (abstract->context, "Opening or closing record %u not found.", i);
 			return DC_STATUS_DATAFORMAT;
@@ -599,12 +773,30 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 		// uncalibrated).
 		WARNING (abstract->context, "Disabled all O2 sensors due to a default calibration value.");
 		parser->calibrated = 0;
-		if (mode != DC_DIVEMODE_OC)
-			dc_field_add_string(&parser->cache, "PPO2 source", "voted/averaged");
+		ppo2_source = "voted/averaged";
 	} else {
 		parser->calibrated = data[base];
-		if (mode != DC_DIVEMODE_OC)
-			dc_field_add_string(&parser->cache, "PPO2 source", "cells");
+		ppo2_source = "cells";
+	}
+
+	// Get the dive mode from the header (if available).
+	if (logversion >= 8) {
+		divemode = data[parser->opening[4] + (pnf ? 1 : 112)];
+	}
+
+	// Get the correct model number from the final block.
+	if (parser->final != UNDEFINED) {
+		parser->model = data[parser->final + 13];
+	}
+
+	// Fix the Teric tank serial number.
+	if (parser->model == TERIC) {
+		for (unsigned int i = 0; i < NTANKS; ++i) {
+			tank[i].serial =
+				((tank[i].serial / 10000) % 100) +
+				((tank[i].serial /   100) % 100) * 100 +
+				((tank[i].serial        ) % 100) * 10000;
+		}
 	}
 
 	// Cache the data for later use.
@@ -612,13 +804,18 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 	parser->logversion = logversion;
 	parser->headersize = headersize;
 	parser->footersize = footersize;
-	parser->ngasmixes = ngasmixes;
-	for (unsigned int i = 0; i < ngasmixes; ++i) {
-		parser->gasmix[i] = gasmix[i];
+	parser->ngasmixes = 0;
+	if (divemode != M_FREEDIVE) {
+		for (unsigned int i = 0; i < ngasmixes; ++i) {
+			if (gasmix[i].oxygen == 0 && gasmix[i].helium == 0)
+				continue;
+			parser->gasmix[parser->ngasmixes] = gasmix[i];
+			parser->ngasmixes++;
+		}
 	}
 	parser->ntanks = 0;
 	for (unsigned int i = 0; i < NTANKS; ++i) {
-		if (tank[i].enabled) {
+		if (tank[i].active) {
 			parser->tankidx[i] = parser->ntanks;
 			parser->tank[parser->ntanks] = tank[i];
 			parser->ntanks++;
@@ -626,12 +823,11 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 			parser->tankidx[i] = UNDEFINED;
 		}
 	}
+	parser->aimode = aimode;
 	parser->units = data[parser->opening[0] + 8];
 	parser->atmospheric = array_uint16_be (data + parser->opening[1] + (parser->pnf ? 16 : 47));
 	parser->density = array_uint16_be (data + parser->opening[3] + (parser->pnf ? 3 : 83));
 	parser->cached = 1;
-
-	DC_ASSIGN_FIELD(parser->cache, DIVEMODE, mode);
 
 	dc_field_add_string_fmt(&parser->cache, "Serial", "%08x", parser->serial);
 	// bytes 1-31 are identical in all formats
@@ -641,6 +837,31 @@ shearwater_predator_parser_cache (shearwater_predator_parser_t *parser)
 	dc_field_add_string_fmt(&parser->cache, "Battery at end", "%.1f V", data[9] / 10.0);
 	add_battery_info(parser, "T1 battery", tank[0].battery);
 	add_battery_info(parser, "T2 battery", tank[1].battery);
+
+	switch (divemode) {
+	case M_CC:
+	case M_CC2:
+		DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_CCR);
+		if (ppo2_source)
+			dc_field_add_string(&parser->cache, "PPO2 source", ppo2_source);
+		break;
+	case M_SC:
+		DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_SCR);
+		break;
+	case M_OC_TEC:
+	case M_OC_REC:
+		DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_OC);
+		break;
+	case M_GAUGE:
+	case M_PPO2:
+		DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_GAUGE);
+		break;
+	case M_FREEDIVE:
+		DC_ASSIGN_FIELD(parser->cache, DIVEMODE, DC_DIVEMODE_FREEDIVE);
+		break;
+	default:
+		break;
+	}
 
 	return DC_STATUS_SUCCESS;
 }
@@ -657,9 +878,13 @@ shearwater_predator_parser_get_field (dc_parser_t *abstract, dc_field_type_t typ
 	if (rc != DC_STATUS_SUCCESS)
 		return rc;
 
+	unsigned int decomodel_idx = parser->pnf ? parser->opening[2] + 18 : 67;
+	unsigned int gf_idx        = parser->pnf ? parser->opening[0] +  4 : 4;
+
 	dc_gasmix_t *gasmix = (dc_gasmix_t *) value;
 	dc_tank_t *tank = (dc_tank_t *) value;
 	dc_salinity_t *water = (dc_salinity_t *) value;
+	dc_decomodel_t *decomodel = (dc_decomodel_t *) value;
 	dc_field_string_t *string = (dc_field_string_t *) value;
 
 	if (value) {
@@ -709,6 +934,27 @@ shearwater_predator_parser_get_field (dc_parser_t *abstract, dc_field_type_t typ
 			break;
 		case DC_FIELD_DIVEMODE:
 			return DC_FIELD_VALUE(parser->cache, value, DIVEMODE);
+		case DC_FIELD_DECOMODEL:
+			switch (data[decomodel_idx]) {
+			case GF:
+				decomodel->type = DC_DECOMODEL_BUHLMANN;
+				decomodel->conservatism = 0;
+				decomodel->params.gf.low  = data[gf_idx + 0];
+				decomodel->params.gf.high = data[gf_idx + 1];
+				break;
+			case VPMB:
+			case VPMB_GFS:
+				decomodel->type = DC_DECOMODEL_VPM;
+				decomodel->conservatism = data[decomodel_idx + 1];
+				break;
+			case DCIEM:
+				decomodel->type = DC_DECOMODEL_DCIEM;
+				decomodel->conservatism = 0;
+				break;
+			default:
+				return DC_STATUS_DATAFORMAT;
+			}
+			break;
 		case DC_FIELD_STRING:
 			return dc_field_get_string(&parser->cache, flags, string);
 		default:
@@ -734,12 +980,12 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 		return rc;
 
 	// Previous gas mix.
-	unsigned int o2_previous = 0, he_previous = 0;
+	unsigned int o2_previous = UNDEFINED, he_previous = UNDEFINED, dil_previous = UNDEFINED;
 
 	// Sample interval.
 	unsigned int time = 0;
 	unsigned int interval = 10;
-	if (parser->pnf && parser->logversion >= 9) {
+	if (parser->pnf && parser->logversion >= 9 && parser->opening[5] != UNDEFINED) {
 		interval = array_uint16_be (data + parser->opening[5] + 23);
 		if (interval % 1000 != 0) {
 			ERROR (abstract->context, "Unsupported sample interval (%u ms).", interval);
@@ -754,41 +1000,6 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 	while (offset + parser->samplesize <= length) {
 		dc_sample_value_t sample = {0};
 
-		// stop parsing if we see the end block
-		if (pnf && data[offset] == LOG_RECORD_FINAL && data[offset + 1] == 0xFD)
-			break;
-
-		if (pnf && data[offset] == LOG_RECORD_INFO_EVENT) {
-			// additional events defined in PNF
-			INFO(abstract->context, "PNF INFO_EVENT ID %u time %u W1 %u W2 %u", data[offset + 1],
-											    array_uint32_be (data + offset + 4),
-											    array_uint32_be (data + offset + 8),
-											    array_uint32_be (data + offset + 12));
-			if (data[offset + 1] == INFO_EVENT_TAG_LOG) {
-				// this is a TAG
-				// its time is a unix timestamp, so we need to subtract the dive start time
-				unsigned int tag_time = array_uint32_be (data + offset + 4) - array_uint32_be (data + parser->opening[0] + 12);
-				unsigned int tag_heading = array_uint32_be (data + offset + 8);
-				unsigned int tag_type = array_uint32_be (data + offset + 12);
-				// heading is only valid if 0..360
-				// type is only valid if 0..5
-				if (tag_heading <= 360 && tag_type <= 5) {
-					// encode this as a bookmark event, using the flags to capture the type and value for heading
-					sample.event.type = SAMPLE_EVENT_BOOKMARK;
-					sample.event.time = tag_time;
-					sample.event.flags = (tag_type + 1) << SAMPLE_FLAGS_TYPE_SHIFT; // 0 means it isn't a tag
-					sample.event.value = tag_heading;
-					if (callback) callback (DC_SAMPLE_EVENT, sample, userdata);
-				}
-			}
-			offset += parser->samplesize;
-			continue;
-		}
-		// Ignore blocks that aren't dive samples
-		if (pnf && data[offset] != LOG_RECORD_DIVE_SAMPLE) {
-			offset += parser->samplesize;
-			continue;
-		}
 		// Ignore empty samples.
 		if (array_isequal (data + offset, parser->samplesize, 0x00)) {
 			offset += parser->samplesize;
@@ -797,6 +1008,10 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 
 		// Get the record type.
 		unsigned int type = pnf ? data[offset] : LOG_RECORD_DIVE_SAMPLE;
+
+		// stop parsing if we see the end block
+		if (type == LOG_RECORD_FINAL && data[offset + 1] == 0xFD)
+			break;
 
 		if (type == LOG_RECORD_DIVE_SAMPLE) {
 			// Time (seconds).
@@ -829,8 +1044,9 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 
 			// Status flags.
 			unsigned int status = data[offset + pnf + 11];
+			unsigned int ccr = (status & OC) == 0;
 
-			if ((status & OC) == 0) {
+			if (ccr) {
 				// PPO2
 				if ((status & PPO2_EXTERNAL) == 0) {
 					if (!parser->calibrated) {
@@ -871,8 +1087,9 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 			// Gaschange.
 			unsigned int o2 = data[offset + pnf + 7];
 			unsigned int he = data[offset + pnf + 8];
-			if (o2 != o2_previous || he != he_previous) {
-				unsigned int idx = shearwater_predator_find_gasmix (parser, o2, he);
+			if ((o2 != o2_previous || he != he_previous || ccr != dil_previous) &&
+				(o2 != 0 || he != 0)) {
+				unsigned int idx = shearwater_predator_find_gasmix (parser, o2, he, ccr);
 				if (idx >= parser->ngasmixes) {
 					ERROR (abstract->context, "Invalid gas mix.");
 					return DC_STATUS_DATAFORMAT;
@@ -882,6 +1099,7 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 				if (callback) callback (DC_SAMPLE_GASMIX, sample, userdata);
 				o2_previous = o2;
 				he_previous = he;
+				dil_previous = ccr;
 			}
 
 			// Deco stop / NDL.
@@ -902,8 +1120,8 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 			// for logversion 7 and newer (introduced for Perdix AI)
 			// detect tank pressure
 			if (parser->logversion >= 7) {
-				const unsigned int idx[NTANKS] = {27, 19};
-				for (unsigned int i = 0; i < NTANKS; ++i) {
+				const unsigned int idx[2] = {27, 19};
+				for (unsigned int i = 0; i < 2; ++i) {
 					// Tank pressure
 					// Values above 0xFFF0 are special codes:
 					//    0xFFFF AI is off
@@ -914,9 +1132,10 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 					// level (0=normal, 1=critical, 2=warning), and the lower 12
 					// bits the tank pressure in units of 2 psi.
 					unsigned int pressure = array_uint16_be (data + offset + pnf + idx[i]);
+					unsigned int id = (parser->aimode == AI_HPCCR ? 4 : 0) + i;
 					if (pressure < 0xFFF0) {
 						pressure &= 0x0FFF;
-						sample.pressure.tank = parser->tankidx[i];
+						sample.pressure.tank = parser->tankidx[id];
 						sample.pressure.value = pressure * 2 * PSI / BAR;
 						if (callback) callback (DC_SAMPLE_PRESSURE, sample, userdata);
 					}
@@ -932,6 +1151,32 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 				if (data[offset + pnf + 21] < 0xF0) {
 					sample.rbt = data[offset + pnf + 21];
 					if (callback) callback (DC_SAMPLE_RBT, sample, userdata);
+				}
+			}
+		} else if (type == LOG_RECORD_DIVE_SAMPLE_EXT) {
+			// Tank pressure
+			if (parser->logversion >= 13) {
+				for (unsigned int i = 0; i < 2; ++i) {
+					unsigned int pressure = array_uint16_be (data + offset + pnf + i * 2);
+					unsigned int id = 2 + i;
+					if (pressure < 0xFFF0) {
+						pressure &= 0x0FFF;
+						sample.pressure.tank = parser->tankidx[id];
+						sample.pressure.value = pressure * 2 * PSI / BAR;
+						if (callback) callback (DC_SAMPLE_PRESSURE, sample, userdata);
+					}
+				}
+			}
+			// Tank pressure (HP CCR)
+			if (parser->logversion >= 14) {
+				for (unsigned int i = 0; i < 2; ++i) {
+					unsigned int pressure = array_uint16_be (data + offset + pnf + 4 + i * 2);
+					unsigned int id = 4 + i;
+					if (pressure) {
+						sample.pressure.tank = parser->tankidx[id];
+						sample.pressure.value = pressure * 2 * PSI / BAR;
+						if (callback) callback (DC_SAMPLE_PRESSURE, sample, userdata);
+					}
 				}
 			}
 		} else if (type == LOG_RECORD_FREEDIVE_SAMPLE) {
@@ -953,7 +1198,7 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 
 				// Depth (absolute pressure in millibar)
 				unsigned int depth = array_uint16_be (data + idx + 1);
-				sample.depth = (depth - parser->atmospheric) * (BAR / 1000.0) / (parser->density * GRAVITY);
+				sample.depth = (signed int)(depth - parser->atmospheric) * (BAR / 1000.0) / (parser->density * GRAVITY);
 				if (callback) callback (DC_SAMPLE_DEPTH, sample, userdata);
 
 				// Temperature (1/10 °C).
@@ -961,9 +1206,30 @@ shearwater_predator_parser_samples_foreach (dc_parser_t *abstract, dc_sample_cal
 				sample.temperature = temperature / 10.0;
 				if (callback) callback (DC_SAMPLE_TEMPERATURE, sample, userdata);
 			}
+		} else if (type == LOG_RECORD_INFO_EVENT) {
+			unsigned int event = data[offset + 1];
+			unsigned int timestamp = array_uint32_be (data + offset + 4);
+			unsigned int w1 = array_uint32_be (data + offset + 8);
+			unsigned int w2 = array_uint32_be (data + offset + 12);
+
+			if (event == INFO_EVENT_TAG_LOG) {
+				// Compass heading
+				if (w1 != 0xFFFFFFFF) {
+					sample.bearing = w1;
+					if (callback) callback (DC_SAMPLE_BEARING, sample, userdata);
+				}
+
+				// Tag
+				sample.event.type = SAMPLE_EVENT_BOOKMARK;
+				sample.event.time = 0;
+				sample.event.flags = 0;
+				sample.event.value = w2;
+				if (callback) callback (DC_SAMPLE_EVENT, sample, userdata);
+			}
 		}
 
 		offset += parser->samplesize;
 	}
+
 	return DC_STATUS_SUCCESS;
 }

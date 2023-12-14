@@ -39,6 +39,7 @@
 
 #define MAXCONFIG 7
 #define NGASMIXES 15
+#define OSTC4_CC_DILUENT_GAS_OFFSET 5
 
 #define UNDEFINED 0xFFFFFFFF
 
@@ -81,8 +82,6 @@
 
 #define OSTC4      0x3B
 
-#define UNSUPPORTED 0xFFFFFFFF
-
 #define OSTC3FW(major,minor) ( \
 		(((major) & 0xFF) << 8) | \
 		((minor) & 0xFF))
@@ -102,24 +101,27 @@ typedef struct hw_ostc_sample_info_t {
 typedef struct hw_ostc_layout_t {
 	unsigned int datetime;
 	unsigned int maxdepth;
-	unsigned int avgdepth;
 	unsigned int divetime;
-	unsigned int atmospheric;
-	unsigned int salinity;
-	unsigned int duration;
 	unsigned int temperature;
-	unsigned int battery;
+	unsigned int atmospheric;
 	unsigned int desat;
 	unsigned int firmware;
-	unsigned int deco_info1;
-	unsigned int deco_info2;
-	unsigned int decomode;
+	unsigned int battery;
 	unsigned int battery_percentage;
+	unsigned int salinity;
+	unsigned int avgdepth;
+	unsigned int duration;
+	unsigned int gf;
+	unsigned int decomodel;
+	unsigned int divemode;
 } hw_ostc_layout_t;
 
 typedef struct hw_ostc_gasmix_t {
 	unsigned int oxygen;
 	unsigned int helium;
+	unsigned int type;
+	unsigned int enabled;
+	unsigned int diluent;
 } hw_ostc_gasmix_t;
 
 typedef struct hw_ostc_parser_t {
@@ -138,6 +140,7 @@ typedef struct hw_ostc_parser_t {
 	unsigned int initial_setpoint;
 	unsigned int initial_cns;
 	hw_ostc_gasmix_t gasmix[NGASMIXES];
+	unsigned int current_divemode_ccr;
 } hw_ostc_parser_t;
 
 static dc_status_t hw_ostc_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsigned int size);
@@ -149,6 +152,9 @@ static const dc_parser_vtable_t hw_ostc_parser_vtable = {
 	sizeof(hw_ostc_parser_t),
 	DC_FAMILY_HW_OSTC,
 	hw_ostc_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	hw_ostc_parser_get_datetime, /* datetime */
 	hw_ostc_parser_get_field, /* fields */
 	hw_ostc_parser_samples_foreach, /* samples_foreach */
@@ -158,59 +164,59 @@ static const dc_parser_vtable_t hw_ostc_parser_vtable = {
 static const hw_ostc_layout_t hw_ostc_layout_ostc = {
 	3,  /* datetime */
 	8,  /* maxdepth */
-	45, /* avgdepth */
 	10, /* divetime */
-	15, /* atmospheric */
-	43, /* salinity */
-	47, /* duration */
 	13, /* temperature */
-	34, /* battery volt after dive */
+	15, /* atmospheric */
 	17, /* desat */
 	32, /* firmware */
-	49, /* deco_info1 */
-	50, /* deco_info1 */
-	51, /* decomode */
+	34, /* battery volt after dive */
 	0,  /* battery percentage TBD */
+	43, /* salinity */
+	45, /* avgdepth */
+	47, /* duration */
+	49, /* gf */
+	UNDEFINED, /* decomodel */
+	51, /* divemode */
 };
 
 static const hw_ostc_layout_t hw_ostc_layout_frog = {
 	9,  /* datetime */
 	14, /* maxdepth */
-	45, /* avgdepth */
 	16, /* divetime */
-	21, /* atmospheric */
-	43, /* salinity */
-	47, /* duration */
 	19, /* temperature */
-	34, /* battery volt after dive */
+	21, /* atmospheric */
 	23, /* desat */
 	32, /* firmware */
-	49, /* deco_info1 */
-	50, /* deco_info2 */
-	51, /* decomode */
+	34, /* battery volt after dive */
 	0,  /* battery percentage TBD */
+	43, /* salinity */
+	45, /* avgdepth */
+	47, /* duration */
+	49, /* gf */
+	UNDEFINED, /* decomodel */
+	51, /* divemode */
 };
 
 static const hw_ostc_layout_t hw_ostc_layout_ostc3 = {
 	12, /* datetime */
 	17, /* maxdepth */
-	73, /* avgdepth */
 	19, /* divetime */
-	24, /* atmospheric */
-	70, /* salinity */
-	75, /* duration */
 	22, /* temperature */
-	50, /* battery volt after dive */
+	24, /* atmospheric */
 	26, /* desat */
 	48, /* firmware */
-	77, /* deco_info1 */
-	78, /* deco_info2 */
-	79, /* decomode */
-        59, /* battery percentage */
+	50, /* battery volt after dive */
+	59, /* battery percentage */
+	70, /* salinity */
+	73, /* avgdepth */
+	75, /* duration */
+	77, /* gf */
+	79, /* decomodel */
+	82, /* divemode */
 };
 
 static unsigned int
-hw_ostc_find_gasmix (hw_ostc_parser_t *parser, unsigned int o2, unsigned int he, unsigned int type)
+hw_ostc_find_gasmix (hw_ostc_parser_t *parser, unsigned int o2, unsigned int he, unsigned int dil, unsigned int type)
 {
 	unsigned int offset = 0;
 	unsigned int count = parser->ngasmixes;
@@ -222,12 +228,24 @@ hw_ostc_find_gasmix (hw_ostc_parser_t *parser, unsigned int o2, unsigned int he,
 
 	unsigned int i = offset;
 	while (i < count) {
-		if (o2 == parser->gasmix[i].oxygen && he == parser->gasmix[i].helium)
+		if (o2 == parser->gasmix[i].oxygen && he == parser->gasmix[i].helium && dil == parser->gasmix[i].diluent)
 			break;
 		i++;
 	}
 
 	return i;
+}
+
+static unsigned int
+hw_ostc_is_ccr (unsigned int divemode, unsigned int version)
+{
+	if (version == 0x21) {
+		return divemode == OSTC_ZHL16_CC || divemode == OSTC_ZHL16_CC_GF || divemode == OSTC_PSCR_GF;
+	} else if (version == 0x23 || version == 0x24) {
+		return divemode == OSTC3_CC || divemode == OSTC3_PSCR;
+	} else {
+		return 0;
+	}
 }
 
 static dc_status_t
@@ -278,6 +296,13 @@ hw_ostc_parser_cache (hw_ostc_parser_t *parser)
 		return DC_STATUS_DATAFORMAT;
 	}
 
+	// Get the dive mode.
+	unsigned int divemode = layout->divemode < header ?
+		data[layout->divemode] : UNDEFINED;
+
+	// Get the CCR mode.
+	unsigned int ccr = hw_ostc_is_ccr (divemode, version);
+
 	// Get all the gas mixes, the index of the inital mix,
 	// the initial setpoint (used in the fixed setpoint CCR mode),
 	// and the initial CNS from the header
@@ -294,19 +319,25 @@ hw_ostc_parser_cache (hw_ostc_parser_t *parser)
 		for (unsigned int i = 0; i < ngasmixes; ++i) {
 			gasmix[i].oxygen = data[25 + 2 * i];
 			gasmix[i].helium = 0;
+			gasmix[i].type = 0;
+			gasmix[i].enabled = 1;
+			gasmix[i].diluent = 0;
 		}
 	} else if (version == 0x23 || version == 0x24) {
 		ngasmixes = 5;
 		for (unsigned int i = 0; i < ngasmixes; ++i) {
 			gasmix[i].oxygen = data[28 + 4 * i + 0];
 			gasmix[i].helium = data[28 + 4 * i + 1];
+			gasmix[i].type   = data[28 + 4 * i + 3];
+			gasmix[i].enabled = gasmix[i].type != 0;
+			gasmix[i].diluent = ccr;
 			// Find the first gas marked as the initial gas.
 			if (initial == UNDEFINED && data[28 + 4 * i + 3] == 1) {
 				initial = i + 1; /* One based index! */
 			}
 		}
 		// The first fixed setpoint is the initial setpoint in CCR mode.
-		if (data[82] == OSTC3_CC) {
+		if (ccr) {
 			initial_setpoint = data[60];
 		}
 		// Initial CNS
@@ -319,6 +350,13 @@ hw_ostc_parser_cache (hw_ostc_parser_t *parser)
 		for (unsigned int i = 0; i < ngasmixes; ++i) {
 			gasmix[i].oxygen = data[19 + 2 * i + 0];
 			gasmix[i].helium = data[19 + 2 * i + 1];
+			gasmix[i].type = 0;
+			if (version == 0x21) {
+				gasmix[i].enabled = data[53] & (1 << i);
+			} else {
+				gasmix[i].enabled = 1;
+			}
+			gasmix[i].diluent = ccr;
 		}
 	}
 	if (initial != UNDEFINED) {
@@ -378,6 +416,9 @@ hw_ostc_parser_create_internal (dc_parser_t **out, dc_context_t *context, unsign
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->gasmix[i].oxygen = 0;
 		parser->gasmix[i].helium = 0;
+		parser->gasmix[i].type = 0;
+		parser->gasmix[i].enabled = 0;
+		parser->gasmix[i].diluent = 0;
 	}
 	parser->serial = serial;
 
@@ -417,6 +458,9 @@ hw_ostc_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsig
 	for (unsigned int i = 0; i < NGASMIXES; ++i) {
 		parser->gasmix[i].oxygen = 0;
 		parser->gasmix[i].helium = 0;
+		parser->gasmix[i].type = 0;
+		parser->gasmix[i].enabled = 0;
+		parser->gasmix[i].diluent = 0;
 	}
 
 	return DC_STATUS_SUCCESS;
@@ -428,7 +472,6 @@ hw_ostc_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime)
 {
 	hw_ostc_parser_t *parser = (hw_ostc_parser_t *) abstract;
 	const unsigned char *data = abstract->data;
-	unsigned int size = abstract->size;
 
 	// Cache the header data.
 	dc_status_t rc = hw_ostc_parser_cache (parser);
@@ -484,14 +527,13 @@ hw_ostc_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime)
 	return DC_STATUS_SUCCESS;
 }
 
-#define BUFLEN 32
+#define BUFLEN 64
 
 static dc_status_t
 hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value)
 {
 	hw_ostc_parser_t *parser = (hw_ostc_parser_t *) abstract;
 	const unsigned char *data = abstract->data;
-	unsigned int size = abstract->size;
 
 	// Cache the header data.
 	dc_status_t rc = hw_ostc_parser_cache (parser);
@@ -510,6 +552,7 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 
 	dc_gasmix_t *gasmix = (dc_gasmix_t *) value;
 	dc_salinity_t *water = (dc_salinity_t *) value;
+	dc_decomodel_t *decomodel = (dc_decomodel_t *) value;
 	dc_field_string_t *string = (dc_field_string_t *) value;
 
 	unsigned int salinity = data[layout->salinity];
@@ -530,6 +573,7 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 				return DC_STATUS_UNSUPPORTED;
 			*((double *) value) = array_uint16_le (data + layout->avgdepth) / 100.0;
 			break;
+		case DC_FIELD_TANK_COUNT:
 		case DC_FIELD_GASMIX_COUNT:
 			*((unsigned int *) value) = parser->ngasmixes;
 			break;
@@ -537,6 +581,19 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 			gasmix->oxygen = parser->gasmix[flags].oxygen / 100.0;
 			gasmix->helium = parser->gasmix[flags].helium / 100.0;
 			gasmix->nitrogen = 1.0 - gasmix->oxygen - gasmix->helium;
+			break;
+		case DC_FIELD_TANK:
+			if (flags >= parser->ngasmixes) {
+				return DC_STATUS_UNSUPPORTED;
+			}
+
+			dc_tank_t *tank = (dc_tank_t *) value;
+
+			tank->volume = 0.0;
+			tank->gasmix = flags;
+			tank->workpressure = 0.0;
+			tank->type = DC_TANKINFO_METRIC | (parser->gasmix[flags].diluent ? DC_TANKINFO_CC_DILUENT : 0);
+
 			break;
 		case DC_FIELD_SALINITY:
 			if (salinity < 100 || salinity > 104)
@@ -556,7 +613,7 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 			break;
 		case DC_FIELD_DIVEMODE:
 			if (version == 0x21) {
-				switch (data[51]) {
+				switch (data[layout->divemode]) {
 				case OSTC_APNEA:
 					*((dc_divemode_t *) value) = DC_DIVEMODE_FREEDIVE;
 					break;
@@ -578,7 +635,7 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 					return DC_STATUS_DATAFORMAT;
 				}
 			} else if (version == 0x22) {
-				switch (data[51]) {
+				switch (data[layout->divemode]) {
 				case FROG_ZHL16:
 				case FROG_ZHL16_GF:
 					*((dc_divemode_t *) value) = DC_DIVEMODE_OC;
@@ -590,7 +647,7 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 					return DC_STATUS_DATAFORMAT;
 				}
 			} else if (version == 0x23 || version == 0x24) {
-				switch (data[82]) {
+				switch (data[layout->divemode]) {
 				case OSTC3_OC:
 					*((dc_divemode_t *) value) = DC_DIVEMODE_OC;
 					break;
@@ -612,6 +669,70 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 			} else {
 				return DC_STATUS_UNSUPPORTED;
 			}
+			break;
+		case DC_FIELD_DECOMODEL:
+			if (version == 0x21) {
+				switch (data[layout->divemode]) {
+				case OSTC_APNEA:
+				case OSTC_GAUGE:
+					decomodel->type = DC_DECOMODEL_NONE;
+					break;
+				case OSTC_ZHL16_OC:
+				case OSTC_ZHL16_CC:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = 100;
+					decomodel->params.gf.high = 100;
+					break;
+				case OSTC_ZHL16_OC_GF:
+				case OSTC_ZHL16_CC_GF:
+				case OSTC_PSCR_GF:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = data[layout->gf + 0];
+					decomodel->params.gf.high = data[layout->gf + 1];
+					break;
+				default:
+					return DC_STATUS_DATAFORMAT;
+				}
+			} else if (version == 0x22) {
+				switch (data[layout->divemode]) {
+				case FROG_ZHL16:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = 100;
+					decomodel->params.gf.high = 100;
+					break;
+				case FROG_ZHL16_GF:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = data[layout->gf + 0];
+					decomodel->params.gf.high = data[layout->gf + 1];
+					break;
+				case FROG_APNEA:
+					decomodel->type = DC_DECOMODEL_NONE;
+					break;
+				default:
+					return DC_STATUS_DATAFORMAT;
+				}
+			} else if (version == 0x23 || version == 0x24) {
+				switch (data[layout->decomodel]) {
+				case OSTC3_ZHL16:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = 100;
+					decomodel->params.gf.high = 100;
+					break;
+				case OSTC3_ZHL16_GF:
+					decomodel->type = DC_DECOMODEL_BUHLMANN;
+					decomodel->params.gf.low  = data[layout->gf + 0];
+					decomodel->params.gf.high = data[layout->gf + 1];
+					break;
+				case OSTC4_VPM:
+					decomodel->type = DC_DECOMODEL_VPM;
+					break;
+				default:
+					return DC_STATUS_DATAFORMAT;
+				}
+			} else {
+				return DC_STATUS_UNSUPPORTED;
+			}
+			decomodel->conservatism = 0;
 			break;
 		case DC_FIELD_STRING:
 			switch(flags) {
@@ -655,29 +776,29 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 
 			case 4: /* Deco model */
 				string->desc = "Deco model";
-				if (((version == 0x23 || version == 0x24) && data[layout->decomode] == OSTC3_ZHL16) ||
-						(version == 0x22 && data[layout->decomode] == FROG_ZHL16) ||
-						(version == 0x21 && (data[layout->decomode] == OSTC_ZHL16_OC || data[layout->decomode] == OSTC_ZHL16_CC)))
+				if (((version == 0x23 || version == 0x24) && data[layout->decomodel] == OSTC3_ZHL16) ||
+						(version == 0x22 && data[layout->divemode] == FROG_ZHL16) ||
+						(version == 0x21 && (data[layout->divemode] == OSTC_ZHL16_OC || data[layout->divemode] == OSTC_ZHL16_CC)))
 					strncpy(buf, "ZH-L16", BUFLEN);
-				else if (((version == 0x23 || version == 0x24) && data[layout->decomode] == OSTC3_ZHL16_GF) ||
-						(version == 0x22 && data[layout->decomode] == FROG_ZHL16_GF) ||
-						(version == 0x21 && (data[layout->decomode] == OSTC_ZHL16_OC_GF || data[layout->decomode] == OSTC_ZHL16_CC_GF)))
+				else if (((version == 0x23 || version == 0x24) && data[layout->decomodel] == OSTC3_ZHL16_GF) ||
+						(version == 0x22 && data[layout->divemode] == FROG_ZHL16_GF) ||
+						(version == 0x21 && (data[layout->divemode] == OSTC_ZHL16_OC_GF || data[layout->divemode] == OSTC_ZHL16_CC_GF)))
 					strncpy(buf, "ZH-L16-GF", BUFLEN);
-				else if (((version == 0x24) && data[layout->decomode] == OSTC4_VPM))
+				else if (((version == 0x24) && data[layout->divemode] == OSTC4_VPM))
 					strncpy(buf, "VPM", BUFLEN);
 				else
 					return DC_STATUS_DATAFORMAT;
 				break;
 			case 5: /* Deco model info */
 				string->desc = "Deco model info";
-				if (((version == 0x23 || version == 0x24) && data[layout->decomode] == OSTC3_ZHL16) ||
-						(version == 0x22 && data[layout->decomode] == FROG_ZHL16) ||
-						(version == 0x21 && (data[layout->decomode] == OSTC_ZHL16_OC || data[layout->decomode] == OSTC_ZHL16_CC)))
-					snprintf(buf, BUFLEN, "Saturation %u, Desaturation %u", layout->deco_info1, layout->deco_info2);
-				else if (((version == 0x23 || version == 0x24) && data[layout->decomode] == OSTC3_ZHL16_GF) ||
-						(version == 0x22 && data[layout->decomode] == FROG_ZHL16_GF) ||
-						(version == 0x21 && (data[layout->decomode] == OSTC_ZHL16_OC_GF || data[layout->decomode] == OSTC_ZHL16_CC_GF)))
-					snprintf(buf, BUFLEN, "GF %u/%u", data[layout->deco_info1], data[layout->deco_info2]);
+				if (((version == 0x23 || version == 0x24) && data[layout->decomodel] == OSTC3_ZHL16) ||
+						(version == 0x22 && data[layout->divemode] == FROG_ZHL16) ||
+						(version == 0x21 && (data[layout->divemode] == OSTC_ZHL16_OC || data[layout->divemode] == OSTC_ZHL16_CC)))
+					snprintf(buf, BUFLEN, "Saturation %u, Desaturation %u", data[layout->gf], data[layout->gf+1]);
+				else if (((version == 0x23 || version == 0x24) && data[layout->decomodel] == OSTC3_ZHL16_GF) ||
+						(version == 0x22 && data[layout->divemode] == FROG_ZHL16_GF) ||
+						(version == 0x21 && (data[layout->divemode] == OSTC_ZHL16_OC_GF || data[layout->divemode] == OSTC_ZHL16_CC_GF)))
+					snprintf(buf, BUFLEN, "GF %u/%u", data[layout->gf], data[layout->gf+1]);
 				else
 					return DC_STATUS_DATAFORMAT;
 				break;
@@ -694,6 +815,27 @@ hw_ostc_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned 
 	return DC_STATUS_SUCCESS;
 }
 
+
+static void hw_ostc_notify_bailout(hw_ostc_parser_t *parser, const unsigned char *data, unsigned int index, dc_sample_callback_t callback, void *userdata)
+{
+	if (parser->current_divemode_ccr != parser->gasmix[index].diluent) {
+		dc_sample_value_t sample = {
+			.event.type = SAMPLE_EVENT_STRING,
+			.event.flags = SAMPLE_FLAGS_SEVERITY_INFO,
+		};
+		if (parser->gasmix[index].diluent) {
+			sample.event.name = "Switched to closed circuit";
+		} else {
+			sample.event.name = "Switched to open circuit bailout";
+		}
+
+		if (callback) {
+			callback(DC_SAMPLE_EVENT, sample, userdata);
+		}
+
+		parser->current_divemode_ccr = parser->gasmix[index].diluent;
+	}
+}
 
 static dc_status_t
 hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
@@ -712,8 +854,10 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 	const hw_ostc_layout_t *layout = parser->layout;
 
 	// Exit if no profile data available.
-	if (size == header || (size == header + 2 &&
-		data[header] == 0xFD && data[header + 1] == 0xFD)) {
+	const unsigned char empty[] = {0x08, 0x00, 0x00, 0xFD, 0xFD};
+	if (size == header ||
+		(size == header + 2 && memcmp(data + header, empty + 3, 2) == 0) ||
+		(size == header + 5 && memcmp(data + header, empty, 5) == 0)) {
 		parser->cached = PROFILE;
 		return DC_STATUS_SUCCESS;
 	}
@@ -732,14 +876,6 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 		samplerate = data[header + 3];
 	else
 		samplerate = data[36];
-
-	// Get the salinity factor.
-	unsigned int salinity = data[layout->salinity];
-	if (version == 0x23 || version == 0x24)
-		salinity += 100;
-	if (salinity < 100 || salinity > 104)
-		salinity = 100;
-	double hydrostatic = GRAVITY * salinity * 10.0;
 
 	// Get the number of sample descriptors.
 	unsigned int nconfig = 0;
@@ -809,6 +945,14 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 		firmware = array_uint16_be (data + layout->firmware);
 	}
 
+	// Get the dive mode.
+	unsigned int divemode = layout->divemode < header ?
+		data[layout->divemode] : UNDEFINED;
+
+	// Get the CCR mode.
+	unsigned int ccr = hw_ostc_is_ccr (divemode, version);
+	parser->current_divemode_ccr = ccr;
+
 	unsigned int time = 0;
 	unsigned int nsamples = 0;
 	unsigned int tank = parser->initial != UNDEFINED ? parser->initial : 0;
@@ -844,9 +988,9 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 			if (callback) callback (DC_SAMPLE_CNS, sample, userdata);
 		}
 
-		// Depth (mbar).
+		// Depth (1/100 m).
 		unsigned int depth = array_uint16_le (data + offset);
-		sample.depth = (depth * BAR / 1000.0) / hydrostatic;
+		sample.depth = depth / 100.0;
 		if (callback) callback (DC_SAMPLE_DEPTH, sample, userdata);
 		offset += 2;
 
@@ -915,8 +1059,15 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 				return DC_STATUS_DATAFORMAT;
 			}
 			unsigned int o2 = data[offset];
+			unsigned int diluent;
+			if (parser->model == OSTC4) {
+				// all manually added gas mixes on OSTC4 are OC gases
+				diluent = 0;
+			} else {
+				diluent = ccr;
+			}
 			unsigned int he = data[offset + 1];
-			unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, MANUAL);
+			unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, diluent, MANUAL);
 			if (idx >= parser->ngasmixes) {
 				if (idx >= NGASMIXES) {
 					ERROR (abstract->context, "Maximum number of gas mixes reached.");
@@ -924,11 +1075,17 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 				}
 				parser->gasmix[idx].oxygen = o2;
 				parser->gasmix[idx].helium = he;
+				parser->gasmix[idx].type = 0;
+				parser->gasmix[idx].enabled = 1;
+				parser->gasmix[idx].diluent = diluent;
 				parser->ngasmixes = idx + 1;
 			}
 
 			sample.gasmix = idx;
 			if (callback) callback (DC_SAMPLE_GASMIX, sample, userdata);
+
+			hw_ostc_notify_bailout(parser, data, idx, callback, userdata);
+
 			offset += 2;
 			length -= 2;
 		}
@@ -940,14 +1097,21 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 				return DC_STATUS_DATAFORMAT;
 			}
 			unsigned int idx = data[offset];
-			if (idx < 1 || idx > parser->ngasmixes) {
-				ERROR(abstract->context, "Invalid gas mix.");
+			if (idx > parser->nfixed && idx <= parser->nfixed + OSTC4_CC_DILUENT_GAS_OFFSET) {
+				// OSTC4 reports gas changes to another diluent with an offset
+				idx -= OSTC4_CC_DILUENT_GAS_OFFSET;
+			}
+			if (idx < 1 || idx > parser->nfixed) {
+				ERROR(abstract->context, "Invalid gas mix (%u).", idx);
 				return DC_STATUS_DATAFORMAT;
 			}
 			idx--; /* Convert to a zero based index. */
 			sample.gasmix = idx;
 			if (callback) callback (DC_SAMPLE_GASMIX, sample, userdata);
 			tank = idx;
+
+			hw_ostc_notify_bailout(parser, data, idx, callback, userdata);
+
 			offset++;
 			length--;
 		}
@@ -974,7 +1138,7 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 
 				unsigned int o2 = data[offset];
 				unsigned int he = data[offset + 1];
-				unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, MANUAL);
+				unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, 0, MANUAL);
 				if (idx >= parser->ngasmixes) {
 					if (idx >= NGASMIXES) {
 						ERROR (abstract->context, "Maximum number of gas mixes reached.");
@@ -982,11 +1146,17 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 					}
 					parser->gasmix[idx].oxygen = o2;
 					parser->gasmix[idx].helium = he;
+					parser->gasmix[idx].type = 0;
+					parser->gasmix[idx].enabled = 1;
+					parser->gasmix[idx].diluent = 0;
 					parser->ngasmixes = idx + 1;
 				}
 
 				sample.gasmix = idx;
 				if (callback) callback (DC_SAMPLE_GASMIX, sample, userdata);
+
+				hw_ostc_notify_bailout(parser, data, idx, callback, userdata);
+
 				offset += 2;
 				length -= 2;
 			}
@@ -996,12 +1166,12 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 		for (unsigned int i = 0; i < nconfig; ++i) {
 			if (info[i].divisor && (nsamples % info[i].divisor) == 0) {
 				if (length < info[i].size) {
-					// Due to a bug in the hwOS Tech firmware v3.03 to v3.07, and
+					// Due to a bug in the hwOS Tech firmware v3.03 to v3.08, and
 					// the hwOS Sport firmware v10.57 to v10.63, the ppO2 divisor
 					// is sometimes not correctly reset to zero when no ppO2
 					// samples are being recorded.
 					if (info[i].type == PPO2 && parser->hwos && parser->model != OSTC4 &&
-						((firmware >= OSTC3FW(3,3) && firmware <= OSTC3FW(3,7)) ||
+						((firmware >= OSTC3FW(3,3) && firmware <= OSTC3FW(3,8)) ||
 						(firmware >= OSTC3FW(10,57) && firmware <= OSTC3FW(10,63)))) {
 						WARNING (abstract->context, "Reset invalid ppO2 divisor to zero.");
 						info[i].divisor = 0;
@@ -1104,7 +1274,7 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 
 				unsigned int o2 = data[offset];
 				unsigned int he = data[offset + 1];
-				unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, MANUAL);
+				unsigned int idx = hw_ostc_find_gasmix (parser, o2, he, 0, MANUAL);
 				if (idx >= parser->ngasmixes) {
 					if (idx >= NGASMIXES) {
 						ERROR (abstract->context, "Maximum number of gas mixes reached.");
@@ -1112,11 +1282,17 @@ hw_ostc_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t call
 					}
 					parser->gasmix[idx].oxygen = o2;
 					parser->gasmix[idx].helium = he;
+					parser->gasmix[idx].type = 0;
+					parser->gasmix[idx].enabled = 1;
+					parser->gasmix[idx].diluent = 0;
 					parser->ngasmixes = idx + 1;
 				}
 
 				sample.gasmix = idx;
 				if (callback) callback (DC_SAMPLE_GASMIX, sample, userdata);
+
+				hw_ostc_notify_bailout(parser, data, idx, callback, userdata);
+
 				offset += 2;
 				length -= 2;
 			}

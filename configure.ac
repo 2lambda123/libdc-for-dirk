@@ -1,6 +1,6 @@
 # Versioning.
 m4_define([dc_version_major],[0])
-m4_define([dc_version_minor],[7])
+m4_define([dc_version_minor],[8])
 m4_define([dc_version_micro],[0])
 m4_define([dc_version_suffix],[devel-Subsurface-NG])
 m4_define([dc_version],dc_version_major.dc_version_minor.dc_version_micro[]m4_ifset([dc_version_suffix],-[dc_version_suffix]))
@@ -72,18 +72,21 @@ AM_CONDITIONAL([HAVE_MANDOC],[test -n "$MANDOC"])
 # Enable automake silent build rules.
 m4_ifdef([AM_SILENT_RULES],[AM_SILENT_RULES([yes])])
 
-# Checks for native Windows.
-AC_MSG_CHECKING([for native Win32])
+# Checks for operating system.
+AC_MSG_CHECKING([for operating system])
 case "$host" in
   *-*-mingw*)
-    os_win32=yes
+    platform=windows
+    ;;
+  *-*-darwin*)
+    platform=mac
     ;;
   *)
-    os_win32=no
+    platform=default
     ;;
 esac
-AC_MSG_RESULT([$os_win32])
-AM_CONDITIONAL([OS_WIN32], [test "$os_win32" = "yes"])
+AC_MSG_RESULT([$platform])
+AM_CONDITIONAL([OS_WIN32], [test "$platform" = "windows"])
 
 DEPENDENCIES=""
 
@@ -100,16 +103,29 @@ AS_IF([test "x$with_libusb" != "xno"], [
 	])
 ])
 
+# Checks for MTP support.
+AC_ARG_WITH([libmtp],
+	[AS_HELP_STRING([--without-libmtp],
+		[Build without the libmtp library])],
+	[], [with_libmtp=auto])
+AS_IF([test "x$with_libmtp" != "xno"], [
+	PKG_CHECK_MODULES([LIBMTP], [libmtp], [have_libmtp=yes], [have_libmtp=no])
+	AS_IF([test "x$have_libmtp" = "xyes"], [
+		AC_DEFINE([HAVE_LIBMTP], [1], [libmtp library])
+		DEPENDENCIES="$DEPENDENCIES libmtp"
+	])
+])
+
 # Checks for HIDAPI support.
 AC_ARG_WITH([hidapi],
 	[AS_HELP_STRING([--without-hidapi],
 		[Build without the hidapi library])],
-	[], [with_hidapi=auto])
+	[], [with_hidapi=hidapi])
 AS_IF([test "x$with_hidapi" != "xno"], [
-	PKG_CHECK_MODULES([HIDAPI], [hidapi], [have_hidapi=yes], [have_hidapi=no])
+	PKG_CHECK_MODULES([HIDAPI], [$with_hidapi], [have_hidapi=yes], [have_hidapi=no])
 	AS_IF([test "x$have_hidapi" = "xyes"], [
 		AC_DEFINE([HAVE_HIDAPI], [1], [hidapi library])
-		DEPENDENCIES="$DEPENDENCIES hidapi"
+		DEPENDENCIES="$DEPENDENCIES $with_hidapi"
 	])
 ])
 
@@ -154,7 +170,7 @@ AC_CHECK_HEADERS([sys/socket.h linux/types.h linux/irda.h], , , [
 # Checks for header files.
 AC_CHECK_HEADERS([linux/serial.h])
 AC_CHECK_HEADERS([IOKit/serial/ioss.h])
-AC_CHECK_HEADERS([getopt.h])
+AC_CHECK_HEADERS([unistd.h getopt.h])
 AC_CHECK_HEADERS([sys/param.h])
 AC_CHECK_HEADERS([pthread.h])
 AC_CHECK_HEADERS([mach/mach_time.h])
@@ -174,6 +190,7 @@ AC_CHECK_FUNCS([clock_gettime mach_absolute_time])
 AC_CHECK_FUNCS([getopt_long])
 
 # Checks for supported compiler options.
+AX_APPEND_COMPILE_FLAGS([-Werror=unknown-warning-option],[ERROR_CFLAGS])
 AX_APPEND_COMPILE_FLAGS([ \
 	-Wall \
 	-Wshadow \
@@ -191,10 +208,10 @@ AX_APPEND_COMPILE_FLAGS([ \
 	-Wno-pointer-sign \
 	-Wno-shadow \
 	-fmacro-prefix-map='$(top_srcdir)/'= \
-])
+],,[$ERROR_CFLAGS])
 
 # Windows specific compiler options.
-AS_IF([test "$os_win32" = "yes"], [
+AS_IF([test "$platform" = "windows"], [
 	AX_APPEND_COMPILE_FLAGS([-Wno-pedantic-ms-format])
 ])
 
@@ -210,6 +227,25 @@ m4_ifset([dc_version_suffix],[
 	AC_DEFINE(HAVE_VERSION_SUFFIX, [1], [Define if a version suffix is present.])
 ])
 
+# Supported transports
+transport_serial="yes"
+transport_usb="${have_libusb-no}"
+if test "$have_hidapi" = "yes"; then
+	transport_usbhid="yes"
+elif test "$have_libusb" = "yes" && test "$platform" != "mac"; then
+	transport_usbhid="yes"
+else
+	transport_usbhid="no"
+fi
+if test "$platform" = "windows"; then
+	transport_irda="$ac_cv_header_af_irda_h"
+	transport_bluetooth="$ac_cv_header_ws2bth_h"
+else
+	transport_irda="$ac_cv_header_linux_irda_h"
+	transport_bluetooth="${have_bluez-no}"
+fi
+transport_ble="no"
+
 AC_CONFIG_FILES([
    libdivecomputer.pc
    Makefile
@@ -217,10 +253,41 @@ AC_CONFIG_FILES([
    include/libdivecomputer/Makefile
    include/libdivecomputer/version.h
    src/Makefile
-   src/libdivecomputer.rc
    doc/Makefile
    doc/doxygen.cfg
    doc/man/Makefile
    examples/Makefile
 ])
 AC_OUTPUT
+AC_MSG_NOTICE([
+  $PACKAGE $VERSION
+  ===============
+
+  Compiler:
+
+    CC      : $CC
+    CFLAGS  : $CFLAGS
+    LDFLAGS : $LDFLAGS
+
+  Features:
+
+    Logging              : $enable_logging
+    Pseudo terminal      : $enable_pty
+    Example applications : $enable_examples
+    Documentation        : $enable_doc
+
+  Transports:
+
+    Serial    : $transport_serial
+    USB       : $transport_usb
+    USBHID    : $transport_usbhid
+    IrDA      : $transport_irda
+    Bluetooth : $transport_bluetooth
+    BLE       : $transport_ble
+
+  Building:
+
+    Type 'make' to compile $PACKAGE.
+
+    Type 'make install' to install $PACKAGE.
+])

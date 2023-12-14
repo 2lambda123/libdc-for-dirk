@@ -56,8 +56,9 @@ get_profile_first (const unsigned char data[], const oceanic_common_layout_t *la
 	}
 
 	unsigned int npages = (layout->memsize - layout->highmem) / pagesize;
-
-	if (npages > 0x2000) {
+	if (npages > 0x4000) {
+		value &= 0x7FFF;
+	} else if (npages > 0x2000) {
 		value &= 0x3FFF;
 	}  else if (npages > 0x1000) {
 		value &= 0x1FFF;
@@ -86,7 +87,9 @@ get_profile_last (const unsigned char data[], const oceanic_common_layout_t *lay
 
 	unsigned int npages = (layout->memsize - layout->highmem) / pagesize;
 
-	if (npages > 0x2000) {
+	if (npages > 0x4000) {
+		value &= 0x7FFF;
+	} else if (npages > 0x2000) {
 		value &= 0x3FFF;
 	} else if (npages > 0x1000) {
 		value &= 0x1FFF;
@@ -99,26 +102,52 @@ get_profile_last (const unsigned char data[], const oceanic_common_layout_t *lay
 
 
 static int
-oceanic_common_match_pattern (const unsigned char *string, const unsigned char *pattern)
+oceanic_common_match_pattern (const unsigned char *string, const unsigned char *pattern, unsigned int *firmware)
 {
+	unsigned int value = 0;
+	unsigned int count = 0;
+
 	for (unsigned int i = 0; i < PAGESIZE; ++i, ++pattern, ++string) {
-		if (*pattern != '\0' && *pattern != *string)
-			return 0;
+		if (*pattern != '\0') {
+			// Compare the pattern.
+			if (*pattern != *string)
+				return 0;
+		} else {
+			// Extract the firmware version.
+			// This is based on the assumption that (only) the first block of
+			// zeros in the pattern contains the firmware version.
+			if (i == 0 || *(pattern - 1) != '\0')
+				count++;
+			if (count == 1) {
+				value <<= 8;
+				value |= *string;
+			}
+		}
+	}
+
+	if (firmware) {
+		*firmware = value;
 	}
 
 	return 1;
 }
 
-
-int
-oceanic_common_match (const unsigned char *version, const oceanic_common_version_t patterns[], unsigned int n)
+const oceanic_common_version_t *
+oceanic_common_match (const unsigned char *version, const oceanic_common_version_t patterns[], size_t n, unsigned int *firmware)
 {
-	for (unsigned int i = 0; i < n; ++i) {
-		if (oceanic_common_match_pattern (version, patterns[i]))
-			return 1;
+	for (size_t i = 0; i < n; ++i) {
+		unsigned int fw = 0;
+		if (oceanic_common_match_pattern (version, patterns[i].pattern, &fw) &&
+			fw >= patterns[i].firmware)
+		{
+			if (firmware) {
+				*firmware = fw;
+			}
+			return patterns + i;
+		}
 	}
 
-	return 0;
+	return NULL;
 }
 
 
@@ -128,8 +157,10 @@ oceanic_common_device_init (oceanic_common_device_t *device)
 	assert (device != NULL);
 
 	// Set the default values.
+	device->firmware = 0;
 	memset (device->version, 0, sizeof (device->version));
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
+	device->model = 0;
 	device->layout = NULL;
 	device->multipage = 1;
 }
@@ -161,13 +192,16 @@ oceanic_common_device_set_fingerprint (dc_device_t *abstract, const unsigned cha
 dc_status_t
 oceanic_common_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 {
+	dc_status_t status = DC_STATUS_SUCCESS;
 	oceanic_common_device_t *device = (oceanic_common_device_t *) abstract;
 
 	assert (device != NULL);
 	assert (device->layout != NULL);
 
+	const oceanic_common_layout_t *layout = device->layout;
+
 	// Allocate the required amount of memory.
-	if (!dc_buffer_resize (buffer, device->layout->memsize)) {
+	if (!dc_buffer_resize (buffer, layout->memsize)) {
 		ERROR (abstract->context, "Insufficient buffer space available.");
 		return DC_STATUS_NOMEMORY;
 	}
@@ -178,8 +212,30 @@ oceanic_common_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 	vendor.size = sizeof (device->version);
 	device_event_emit (abstract, DC_EVENT_VENDOR, &vendor);
 
-	return device_dump_read (abstract, dc_buffer_get_data (buffer),
+	// Download the memory dump.
+	status = device_dump_read (abstract, 0, dc_buffer_get_data (buffer),
 		dc_buffer_get_size (buffer), PAGESIZE * device->multipage);
+	if (status != DC_STATUS_SUCCESS) {
+		return status;
+	}
+
+	// Emit a device info event.
+	unsigned char *id = dc_buffer_get_data (buffer) + layout->cf_devinfo;
+	dc_event_devinfo_t devinfo;
+	devinfo.model = array_uint16_be (id + 8);
+	devinfo.firmware = device->firmware;
+	if (layout->pt_mode_serial == 0)
+		devinfo.serial = array_convert_bcd2dec (id + 10, 3);
+	else if (layout->pt_mode_serial == 1)
+		devinfo.serial = array_convert_bin2dec (id + 11, 3);
+	else
+		devinfo.serial =
+			(id[11] & 0x0F) * 100000 + ((id[11] & 0xF0) >> 4) * 10000 +
+			(id[12] & 0x0F) * 1000   + ((id[12] & 0xF0) >> 4) * 100 +
+			(id[13] & 0x0F) * 10     + ((id[13] & 0xF0) >> 4) * 1;
+	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
+
+	return status;
 }
 
 
@@ -388,7 +444,7 @@ oceanic_common_device_profile (dc_device_t *abstract, dc_event_progress_t *progr
 			ERROR (abstract->context, "Invalid ringbuffer pointer detected (0x%06x 0x%06x).",
 				rb_entry_first, rb_entry_last);
 			status = DC_STATUS_DATAFORMAT;
-			break;
+			continue;
 		}
 
 		// Calculate the end pointer and the number of bytes.
@@ -477,9 +533,8 @@ oceanic_common_device_profile (dc_device_t *abstract, dc_event_progress_t *progr
 		{
 			ERROR (abstract->context, "Invalid ringbuffer pointer detected (0x%06x 0x%06x).",
 				rb_entry_first, rb_entry_last);
-			dc_rbstream_free (rbstream);
-			free (profiles);
-			return DC_STATUS_DATAFORMAT;
+			status = DC_STATUS_DATAFORMAT;
+			continue;
 		}
 
 		// Calculate the end pointer and the number of bytes.
@@ -506,9 +561,8 @@ oceanic_common_device_profile (dc_device_t *abstract, dc_event_progress_t *progr
 		rc = dc_rbstream_read (rbstream, progress, profiles + offset, rb_entry_size + gap);
 		if (rc != DC_STATUS_SUCCESS) {
 			ERROR (abstract->context, "Failed to read the dive.");
-			dc_rbstream_free (rbstream);
-			free (profiles);
-			return rc;
+			status = rc;
+			break;
 		}
 
 		remaining -= rb_entry_size + gap;
@@ -543,7 +597,7 @@ oceanic_common_device_profile (dc_device_t *abstract, dc_event_progress_t *progr
 	dc_rbstream_free (rbstream);
 	free (profiles);
 
-	return DC_STATUS_SUCCESS;
+	return status;
 }
 
 
@@ -585,11 +639,11 @@ oceanic_common_device_foreach (dc_device_t *abstract, dc_dive_callback_t callbac
 	// Emit a device info event.
 	dc_event_devinfo_t devinfo;
 	devinfo.model = array_uint16_be (id + 8);
-	devinfo.firmware = 0;
+	devinfo.firmware = device->firmware;
 	if (layout->pt_mode_serial == 0)
-		devinfo.serial = bcd2dec (id[10]) * 10000 + bcd2dec (id[11]) * 100 + bcd2dec (id[12]);
+		devinfo.serial = array_convert_bcd2dec (id + 10, 3);
 	else if (layout->pt_mode_serial == 1)
-		devinfo.serial = id[11] * 10000 + id[12] * 100 + id[13];
+		devinfo.serial = array_convert_bin2dec (id + 11, 3);
 	else
 		devinfo.serial =
 			(id[11] & 0x0F) * 100000 + ((id[11] & 0xF0) >> 4) * 10000 +

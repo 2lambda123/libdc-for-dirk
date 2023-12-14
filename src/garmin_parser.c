@@ -30,8 +30,6 @@
 #include "array.h"
 #include "field-cache.h"
 
-#define C_ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
-
 #define MAXFIELDS 128
 
 struct msg_desc;
@@ -40,7 +38,7 @@ struct msg_desc;
 struct type_desc {
 	const char *msg_name;
 	const struct msg_desc *msg_desc;
-	unsigned char nrfields;
+	unsigned char nrfields, devfields;
 	unsigned char fields[MAXFIELDS][3];
 };
 
@@ -48,6 +46,14 @@ struct type_desc {
 // into 180 * val // 2**31 degrees.
 struct pos {
 	int lat, lon;
+};
+
+#define MAX_SENSORS 6
+struct garmin_sensor {
+	unsigned int sensor_id;
+	const char *sensor_name;
+	unsigned char sensor_enabled, sensor_units, sensor_used_for_gas_rate;
+	unsigned int sensor_rated_pressure, sensor_reserve_pressure, sensor_volume;
 };
 
 #define MAXTYPE 16
@@ -59,13 +65,14 @@ struct pos {
 struct record_data {
 	unsigned int pending;
 	unsigned int time;
+	unsigned int timestamp;
 
 	// RECORD_DECO
 	int stop_time;
 	double ceiling;
 
 	// RECORD_GASMIX
-	int index, gas_status;
+	int index, gas_status, gas_type;
 	dc_gasmix_t gasmix;
 
 	// RECORD_EVENT
@@ -77,6 +84,14 @@ struct record_data {
 
 	// RECORD_DECO_MODEL
 	unsigned char model, gf_low, gf_high;
+
+	// RECORD_SENSOR_PROFILE has no data, fills in dive.sensor[nr_sensor]
+
+	// RECORD_TANK_UPDATE
+	unsigned int sensor, pressure;
+
+	// RECORD_SETPOINT_CHANGE
+	unsigned int setpoint_actual_cbar;
 };
 
 #define RECORD_GASMIX		1
@@ -84,6 +99,9 @@ struct record_data {
 #define RECORD_EVENT		4
 #define RECORD_DEVICE_INFO	8
 #define RECORD_DECO_MODEL	16
+#define RECORD_SENSOR_PROFILE	32
+#define RECORD_TANK_UPDATE	64
+#define RECORD_SETPOINT_CHANGE	128
 
 typedef struct garmin_parser_t {
 	dc_parser_t base;
@@ -97,15 +115,22 @@ typedef struct garmin_parser_t {
 	struct type_desc type_desc[MAXTYPE];
 
 	// Field cache
-	unsigned int initialized;
-	unsigned int sub_sport;
-	unsigned int serial;
-	unsigned int product;
-	unsigned int firmware;
-	unsigned int protocol;
-	unsigned int profile;
-	unsigned int time;
-	int utc_offset, time_offset;
+	struct {
+		unsigned int sub_sport;
+		unsigned int serial;
+		unsigned int product;
+		unsigned int firmware;
+		unsigned int protocol;
+		unsigned int profile;
+		unsigned int time;
+		int utc_offset, time_offset;
+		unsigned int nr_sensor;
+		struct garmin_sensor sensor[MAX_SENSORS];
+		unsigned int setpoint_low_cbar, setpoint_high_cbar;
+		unsigned int setpoint_low_switch_depth_mm, setpoint_high_switch_depth_mm;
+		unsigned int setpoint_low_switch_mode, setpoint_high_switch_mode;
+		dc_tankinfo_t *current_tankinfo;
+	} dive;
 
 	// I count nine (!) different GPS fields Hmm.
 	// Reporting all of them just to try to figure
@@ -123,9 +148,24 @@ typedef struct garmin_parser_t {
 	} gps;
 
 	struct dc_field_cache cache;
+	unsigned char is_big_endian; // instead of bool
 } garmin_parser_t;
 
 typedef int (*garmin_data_cb_t)(unsigned char type, const unsigned char *data, int len, void *user);
+
+static inline struct garmin_sensor *current_sensor(garmin_parser_t *garmin)
+{
+	return garmin->dive.sensor + garmin->dive.nr_sensor;
+}
+
+static int find_tank_index(garmin_parser_t *garmin, unsigned int sensor_id)
+{
+	for (int i = 0; i < garmin->dive.nr_sensor; i++) {
+		if (garmin->dive.sensor[i].sensor_id == sensor_id)
+			return i;
+	}
+	return 0;
+}
 
 /*
  * Decode the event. Numbers from Wojtek's fit2subs python script
@@ -163,6 +203,11 @@ static void garmin_event(struct garmin_parser_t *garmin,
 		[21] = { 3, "Battry Critical" },
 		[22] = { 1, "Safety stop begin" },
 		[23] = { 1, "Approaching deco stop" },
+		[24] = { 1, "Automatic switch to low setpoint" },
+		[25] = { 1, "Automatic switch to high setpoint" },
+		[26] = { 2, "Manual switch to low setpoint" },
+		[27] = { 2, "Manual switch to high setpoint" },
+		[32] = { 1, "Tank battery low" },	// No way to know which tank
 	};
 	dc_sample_value_t sample = {0};
 
@@ -177,15 +222,39 @@ static void garmin_event(struct garmin_parser_t *garmin,
 
 		sample.event.type = SAMPLE_EVENT_STRING;
 		sample.event.name = event_desc[data].name;
-		sample.event.flags =  event_desc[data].severity << SAMPLE_FLAGS_SEVERITY_SHIFT;
+		sample.event.flags = event_desc[data].severity << SAMPLE_FLAGS_SEVERITY_SHIFT;
+
+		if (data == 24 || data == 25 || data == 26 || data == 27) {
+			// Update the actual setpoint used during the dive and report it
+			garmin->record_data.setpoint_actual_cbar = (data == 24 || data == 26) ? garmin->dive.setpoint_low_cbar : garmin->dive.setpoint_high_cbar;
+			garmin->record_data.pending |= RECORD_SETPOINT_CHANGE;
+		}
+
 		if (!sample.event.name)
 			return;
 		garmin->callback(DC_SAMPLE_EVENT, sample, garmin->userdata);
 		return;
 
 	case 57:
-		sample.gasmix = data - 1;
+		sample.gasmix = data;
 		garmin->callback(DC_SAMPLE_GASMIX, sample, garmin->userdata);
+
+		dc_tankinfo_t *tankinfo = &garmin->cache.tankinfo[data];
+		if (!garmin->dive.current_tankinfo || (*tankinfo & DC_TANKINFO_CC_DILUENT) != (*garmin->dive.current_tankinfo & DC_TANKINFO_CC_DILUENT)) {
+			dc_sample_value_t sample2 = {0};
+			sample2.event.type = SAMPLE_EVENT_STRING;
+			if (*tankinfo & DC_TANKINFO_CC_DILUENT) {
+				sample2.event.name = "Switched to closed circuit";
+			} else {
+				sample2.event.name = "Switched to open circuit bailout";
+			}
+			sample2.event.flags = 2 << SAMPLE_FLAGS_SEVERITY_SHIFT;
+
+			garmin->callback(DC_SAMPLE_EVENT, sample2, garmin->userdata);
+
+			garmin->dive.current_tankinfo = tankinfo;
+		}
+
 		return;
 	}
 }
@@ -210,16 +279,43 @@ static void flush_pending_record(struct garmin_parser_t *garmin)
 			int index = record->index;
 			if (enabled && index < MAXGASES) {
 				DC_ASSIGN_IDX(garmin->cache, GASMIX, index, record->gasmix);
-				DC_ASSIGN_FIELD(garmin->cache, GASMIX_COUNT, index+1);
+				if (index + 1 > garmin->cache.GASMIX_COUNT) {
+					DC_ASSIGN_FIELD(garmin->cache, GASMIX_COUNT, index + 1);
+					garmin->cache.initialized |= 1 << DC_FIELD_TANK_COUNT;
+				}
+
+				dc_tankinfo_t tankinfo = DC_TANKINFO_METRIC;
+				if (record->gas_type == 1) {
+					tankinfo |= DC_TANKINFO_CC_DILUENT;
+				}
+				garmin->cache.tankinfo[index] = tankinfo;
+				garmin->cache.initialized |= 1 << DC_FIELD_TANK;
 			}
 		}
 		if (pending & RECORD_DEVICE_INFO && record->device_index == 0) {
-			garmin->firmware = record->firmware;
-			garmin->serial = record->serial;
-			garmin->product = record->product;
+			garmin->dive.firmware = record->firmware;
+			garmin->dive.serial = record->serial;
+			garmin->dive.product = record->product;
 		}
 		if (pending & RECORD_DECO_MODEL)
 			dc_field_add_string_fmt(&garmin->cache, "Deco model", "Buhlmann ZHL-16C %u/%u", record->gf_low, record->gf_high);
+
+		// End of sensor record just increments nr_sensor,
+		// so that the next sensor record will start
+		// filling in the next one.
+		//
+		// NOTE! This only happens for tank pods, other
+		// sensors will just overwrite each other.
+		//
+		// Also note that the last sensor is just for
+		// scratch use, so that the sensor record can
+		// always fill in dive.sensor[nr_sensor] with
+		// no checking.
+		if (pending & RECORD_SENSOR_PROFILE) {
+			if (garmin->dive.nr_sensor < MAX_SENSORS-1)
+				garmin->dive.nr_sensor++;
+		}
+
 		return;
 	}
 
@@ -235,6 +331,21 @@ static void flush_pending_record(struct garmin_parser_t *garmin)
 		garmin_event(garmin, record->event_nr, record->event_type,
 			record->event_group, record->event_data, record->event_unknown);
 	}
+
+	if (pending & RECORD_TANK_UPDATE) {
+		dc_sample_value_t sample = {0};
+
+		sample.pressure.tank = find_tank_index(garmin, record->sensor);
+		sample.pressure.value = record->pressure / 100.0;
+		garmin->callback(DC_SAMPLE_PRESSURE, sample, garmin->userdata);
+	}
+
+	if (pending & RECORD_SETPOINT_CHANGE) {
+		dc_sample_value_t sample = {0};
+
+		sample.setpoint = record->setpoint_actual_cbar / 100.0;
+		garmin->callback(DC_SAMPLE_SETPOINT, sample, garmin->userdata);
+	}
 }
 
 
@@ -247,6 +358,9 @@ static const dc_parser_vtable_t garmin_parser_vtable = {
 	sizeof(garmin_parser_t),
 	DC_FAMILY_GARMIN,
 	garmin_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	garmin_parser_get_datetime, /* datetime */
 	garmin_parser_get_field, /* fields */
 	garmin_parser_samples_foreach, /* samples_foreach */
@@ -273,28 +387,51 @@ garmin_parser_create (dc_parser_t **out, dc_context_t *context)
 	return DC_STATUS_SUCCESS;
 }
 
-#define DECLARE_FIT_TYPE(name, ctype, inval) \
+/*
+ * We really shouldn't use array_uint_be/le, since they
+ * can't deal with 64-bit types.
+ *
+ * But we've not actually seen any yet, so..
+ */
+static inline unsigned long long garmin_value(struct garmin_parser_t *g, const unsigned char *p, unsigned int type_size)
+{
+	if (g->is_big_endian)
+		return array_uint_be(p, type_size);
+	else
+		return array_uint_le(p, type_size);
+}
+
+#define FMTSIZE 64
+
+#define DECLARE_FIT_TYPE(name, ctype, inval, fmt) \
 	typedef ctype name;	\
-	static const name name##_INVAL = inval
+	static const name name##_INVAL = inval; \
+	static name name##_VALUE(garmin_parser_t *g, const void *p) \
+	{ return (name) garmin_value(g, p, sizeof(name)); } \
+	static void name##_FORMAT(name val, char *buf) \
+	{ snprintf(buf, FMTSIZE, fmt, val); }
 
-DECLARE_FIT_TYPE(ENUM, unsigned char, 0xff);
-DECLARE_FIT_TYPE(UINT8, unsigned char, 0xff);
-DECLARE_FIT_TYPE(UINT16, unsigned short, 0xffff);
-DECLARE_FIT_TYPE(UINT32, unsigned int, 0xffffffff);
-DECLARE_FIT_TYPE(UINT64, unsigned long long, 0xffffffffffffffffull);
+DECLARE_FIT_TYPE(ENUM, unsigned char, 0xff, "%u");
+DECLARE_FIT_TYPE(UINT8, unsigned char, 0xff, "%u");
+DECLARE_FIT_TYPE(UINT16, unsigned short, 0xffff, "%u");
+DECLARE_FIT_TYPE(UINT32, unsigned int, 0xffffffff, "%u");
+DECLARE_FIT_TYPE(UINT64, unsigned long long, 0xffffffffffffffffull, "%llu");
 
-DECLARE_FIT_TYPE(UINT8Z, unsigned char, 0);
-DECLARE_FIT_TYPE(UINT16Z, unsigned short, 0);
-DECLARE_FIT_TYPE(UINT32Z, unsigned int, 0);
+DECLARE_FIT_TYPE(UINT8Z, unsigned char, 0, "%u");
+DECLARE_FIT_TYPE(UINT16Z, unsigned short, 0, "%u");
+DECLARE_FIT_TYPE(UINT32Z, unsigned int, 0, "%u");
 
-DECLARE_FIT_TYPE(SINT8, signed char, 0x7f);
-DECLARE_FIT_TYPE(SINT16, signed short, 0x7fff);
-DECLARE_FIT_TYPE(SINT32, signed int, 0x7fffffff);
-DECLARE_FIT_TYPE(SINT64, signed long long, 0x7fffffffffffffffll);
+DECLARE_FIT_TYPE(SINT8, signed char, 0x7f, "%d");
+DECLARE_FIT_TYPE(SINT16, signed short, 0x7fff, "%d");
+DECLARE_FIT_TYPE(SINT32, signed int, 0x7fffffff, "%d");
+DECLARE_FIT_TYPE(SINT64, signed long long, 0x7fffffffffffffffll, "%lld");
 
-DECLARE_FIT_TYPE(FLOAT, unsigned int, 0xffffffff);
-DECLARE_FIT_TYPE(DOUBLE, unsigned long long, 0xffffffffffffffffll);
-DECLARE_FIT_TYPE(STRING, char *, NULL);
+DECLARE_FIT_TYPE(FLOAT, unsigned int, 0xffffffff, "%u");
+DECLARE_FIT_TYPE(DOUBLE, unsigned long long, 0xffffffffffffffffll, "%llu");
+DECLARE_FIT_TYPE(STRING, char *, NULL, "\"%s\"");
+
+// Override string value function - it's the pointer itself
+#define STRING_VALUE(g, p) ((char *)(p))
 
 static const struct {
 	const char *type_name;
@@ -339,12 +476,14 @@ struct field_desc {
 	static void parse_##name(struct garmin_parser_t *, const type); \
 	static void parse_##name##_##type(struct garmin_parser_t *g, unsigned char base_type, const unsigned char *p) \
 	{ \
+		char fmtbuf[FMTSIZE]; \
 		if (strcmp(#type, base_type_info[base_type].type_name)) \
 			fprintf(stderr, "%s: %s should be %s\n", #name, #type, base_type_info[base_type].type_name); \
-		type val = *(type *)p; \
+		type val = type##_VALUE(g, p); \
 		if (val == type##_INVAL) return; \
-		DEBUG(g->base.context, "%s (%s): %lld", #name, #type, (long long)val); \
-		parse_##name(g, *(type *)p); \
+		type##_FORMAT(val, fmtbuf); \
+		DEBUG(g->base.context, "%s (%s): %s", #name, #type, fmtbuf); \
+		parse_##name(g, val); \
 	} \
 	static const struct field_desc name##_field_##type = { #name, parse_##name##_##type }; \
 	static void parse_##name(struct garmin_parser_t *garmin, type data)
@@ -354,13 +493,14 @@ struct field_desc {
 // Convert to "standard epoch time" by adding 631065600.
 DECLARE_FIELD(ANY, timestamp, UINT32)
 {
+	garmin->record_data.timestamp = data;
 	if (garmin->callback) {
 		dc_sample_value_t sample = {0};
 
 		// Turn the timestamp relative to the beginning of the dive
-		if (data < garmin->time)
+		if (data < garmin->dive.time)
 			return;
-		data -= garmin->time;
+		data -= garmin->dive.time;
 
 		// Did we already do this?
 		if (data < garmin->record_data.time)
@@ -383,9 +523,10 @@ DECLARE_FIELD(FILE, serial, UINT32Z) { }
 DECLARE_FIELD(FILE, creation_time, UINT32) { }
 DECLARE_FIELD(FILE, number, UINT16) { }
 DECLARE_FIELD(FILE, other_time, UINT32) { }
+DECLARE_FIELD(FILE, product_name, STRING) { }
 
 // SESSION msg
-DECLARE_FIELD(SESSION, start_time, UINT32) { garmin->time = data; }
+DECLARE_FIELD(SESSION, start_time, UINT32)	{ garmin->dive.time = data; }
 DECLARE_FIELD(SESSION, start_pos_lat, SINT32)	{ garmin->gps.SESSION.entry.lat = data; }
 DECLARE_FIELD(SESSION, start_pos_long, SINT32)	{ garmin->gps.SESSION.entry.lon = data; }
 DECLARE_FIELD(SESSION, nec_pos_lat, SINT32)	{ garmin->gps.SESSION.NE.lat = data; }
@@ -418,7 +559,10 @@ DECLARE_FIELD(RECORD, heart_rate, UINT8)		// bpm
 		garmin->callback(DC_SAMPLE_HEARTBEAT, sample, garmin->userdata);
 	}
 }
+DECLARE_FIELD(RECORD, cadence, UINT8) { }		// cadence
+DECLARE_FIELD(RECORD, fract_cadence, UINT8) { }		// fractional cadence
 DECLARE_FIELD(RECORD, distance, UINT32) { }		// Distance in 100 * m? WTF?
+DECLARE_FIELD(RECORD, speed, UINT16) { }		// Speed (m/s?)
 DECLARE_FIELD(RECORD, temperature, SINT8)		// degrees C
 {
 	if (garmin->callback) {
@@ -472,10 +616,15 @@ DECLARE_FIELD(RECORD, cns_load, UINT8)
 	}
 }
 DECLARE_FIELD(RECORD, n2_load, UINT16) { }		// percent
+DECLARE_FIELD(RECORD, air_time_remaining, UINT32) { }	// seconds
+DECLARE_FIELD(RECORD, pressure_sac, UINT16) { }		// 100 * bar/min/pressure
+DECLARE_FIELD(RECORD, volume_sac, UINT16) { }		// 100 * l/min/pressure
+DECLARE_FIELD(RECORD, rmv, UINT16) { }			// 100 * l/min
+DECLARE_FIELD(RECORD, ascent_rate, SINT32) { }		// mm/s (negative is down)
 
 // DEVICE_SETTINGS
-DECLARE_FIELD(DEVICE_SETTINGS, utc_offset, UINT32) { garmin->utc_offset = (SINT32) data; }	// wrong type in FIT
-DECLARE_FIELD(DEVICE_SETTINGS, time_offset, UINT32) { garmin->time_offset = (SINT32) data; }	// wrong type in FIT
+DECLARE_FIELD(DEVICE_SETTINGS, utc_offset, UINT32) { garmin->dive.utc_offset = (SINT32) data; }	// wrong type in FIT
+DECLARE_FIELD(DEVICE_SETTINGS, time_offset, UINT32) { garmin->dive.time_offset = (SINT32) data; }	// wrong type in FIT
 
 // DEVICE_INFO
 // collect the data and then use the record if it is for device_index 0
@@ -500,8 +649,35 @@ DECLARE_FIELD(DEVICE_INFO, firmware, UINT16)
 	garmin->record_data.pending |= RECORD_DEVICE_INFO;
 }
 
+// ACTIVITY
+DECLARE_FIELD(ACTIVITY, total_timer_time, UINT32) { }
+DECLARE_FIELD(ACTIVITY, num_sessions, UINT16) { }
+DECLARE_FIELD(ACTIVITY, type, ENUM) { }
+DECLARE_FIELD(ACTIVITY, event, ENUM) { }
+DECLARE_FIELD(ACTIVITY, event_type, ENUM) { }
+DECLARE_FIELD(ACTIVITY, local_timestamp, UINT32)
+{
+	int time_offset = data - garmin->record_data.timestamp;
+	garmin->dive.time_offset = time_offset;
+}
+DECLARE_FIELD(ACTIVITY, event_group, UINT8) { }
+
 // SPORT
-DECLARE_FIELD(SPORT, sub_sport, ENUM) { garmin->sub_sport = (ENUM) data; }
+DECLARE_FIELD(SPORT, sub_sport, ENUM) {
+	garmin->dive.sub_sport = (ENUM) data;
+	dc_divemode_t val;
+	switch (data) {
+	case 55: val = DC_DIVEMODE_GAUGE;
+		break;
+	case 56:
+	case 57: val = DC_DIVEMODE_FREEDIVE;
+		break;
+	case 63: val = DC_DIVEMODE_CCR;
+		break;
+	default: val = DC_DIVEMODE_OC;
+	}
+	DC_ASSIGN_FIELD(garmin->cache, DIVEMODE, val);
+}
 
 // DIVE_GAS - uses msg index
 DECLARE_FIELD(DIVE_GAS, helium, UINT8)
@@ -519,6 +695,12 @@ DECLARE_FIELD(DIVE_GAS, status, ENUM)
 	// 0 - disabled, 1 - enabled, 2 - backup
 	garmin->record_data.gas_status = data;
 }
+DECLARE_FIELD(DIVE_GAS, type, ENUM)
+{
+	// 0 - open circuit, 1 - CCR diluent
+	garmin->record_data.gas_type = data;
+	garmin->record_data.pending |= RECORD_GASMIX;
+}
 
 // DIVE_SUMMARY
 DECLARE_FIELD(DIVE_SUMMARY, avg_depth, UINT32) { DC_ASSIGN_FIELD(garmin->cache, AVGDEPTH, data / 1000.0); }
@@ -531,6 +713,9 @@ DECLARE_FIELD(DIVE_SUMMARY, end_n2, UINT16) { }			// percent
 DECLARE_FIELD(DIVE_SUMMARY, o2_toxicity, UINT16) { }		// OTUs
 DECLARE_FIELD(DIVE_SUMMARY, dive_number, UINT32) { }
 DECLARE_FIELD(DIVE_SUMMARY, bottom_time, UINT32) { DC_ASSIGN_FIELD(garmin->cache, DIVETIME, data / 1000); }
+DECLARE_FIELD(DIVE_SUMMARY, avg_pressure_sac, UINT16) { }	// 100 * bar/min/pressure
+DECLARE_FIELD(DIVE_SUMMARY, avg_volume_sac, UINT16) { }		// 100 * L/min/pressure
+DECLARE_FIELD(DIVE_SUMMARY, avg_rmv, UINT16) { }		// 100 * L/min
 
 // DIVE_SETTINGS
 DECLARE_FIELD(DIVE_SETTINGS, name, STRING) { }
@@ -575,7 +760,93 @@ DECLARE_FIELD(DIVE_SETTINGS, backlight_timeout, UINT8) { }
 DECLARE_FIELD(DIVE_SETTINGS, repeat_dive_interval, UINT16) { }
 DECLARE_FIELD(DIVE_SETTINGS, safety_stop_time, UINT16) { }
 DECLARE_FIELD(DIVE_SETTINGS, heart_rate_source_type, ENUM) { }
-DECLARE_FIELD(DIVE_SETTINGS, hear_rate_device_type, UINT8) { }
+DECLARE_FIELD(DIVE_SETTINGS, heart_rate_device_type, UINT8) { }
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_low_switch_mode, ENUM)
+{
+	// 0 - manual, 1 - auto
+	garmin->dive.setpoint_low_switch_mode = data;
+}
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_low_cbar, UINT8)
+{
+	garmin->dive.setpoint_low_cbar = data;
+
+	// The initial setpoint at the start of the dive is the low setpoint
+	garmin->record_data.setpoint_actual_cbar = garmin->dive.setpoint_low_cbar;
+	garmin->record_data.pending |= RECORD_SETPOINT_CHANGE;
+}
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_low_switch_depth_mm, UINT32)
+{
+	garmin->dive.setpoint_low_switch_depth_mm = data;
+}
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_high_switch_mode, ENUM)
+{
+	// 0 - manual, 1 - auto
+	garmin->dive.setpoint_high_switch_mode = data;
+}
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_high_cbar, UINT8)
+{
+	garmin->dive.setpoint_high_cbar = data;
+}
+DECLARE_FIELD(DIVE_SETTINGS, setpoint_high_switch_depth_mm, UINT32)
+{
+	garmin->dive.setpoint_high_switch_depth_mm = data;
+}
+
+// SENSOR_PROFILE record for each ANT/BLE sensor.
+// We only care about sensor type 28 - Garmin tank pod.
+DECLARE_FIELD(SENSOR_PROFILE, ant_channel_id, UINT32Z)
+{
+	current_sensor(garmin)->sensor_id = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, name, STRING) { }
+DECLARE_FIELD(SENSOR_PROFILE, enabled, ENUM)
+{
+	current_sensor(garmin)->sensor_enabled = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, sensor_type, UINT8)
+{
+	// 28 is tank pod
+	// start filling in next sensor after this record
+	if (data == 28)
+		garmin->record_data.pending |= RECORD_SENSOR_PROFILE;
+}
+DECLARE_FIELD(SENSOR_PROFILE, pressure_units, ENUM)
+{
+	//  0 is PSI, 1 is KPA (unused), 2 is Bar
+	current_sensor(garmin)->sensor_units = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, rated_pressure, UINT16)
+{
+	current_sensor(garmin)->sensor_rated_pressure = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, reserve_pressure, UINT16)
+{
+	current_sensor(garmin)->sensor_reserve_pressure = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, volume, UINT16)
+{
+	current_sensor(garmin)->sensor_volume = data;
+}
+DECLARE_FIELD(SENSOR_PROFILE, used_for_gas_rate, ENUM)
+{
+	current_sensor(garmin)->sensor_used_for_gas_rate = data;
+}
+
+DECLARE_FIELD(TANK_UPDATE, sensor, UINT32Z)
+{
+	garmin->record_data.sensor = data;
+}
+
+DECLARE_FIELD(TANK_UPDATE, pressure, UINT16)
+{
+	garmin->record_data.pressure = data;
+	garmin->record_data.pending |= RECORD_TANK_UPDATE;
+}
+
+DECLARE_FIELD(TANK_SUMMARY, sensor, UINT32Z) { }	// sensor ID
+DECLARE_FIELD(TANK_SUMMARY, start_pressure, UINT16) { }	// Bar * 100
+DECLARE_FIELD(TANK_SUMMARY, end_pressure, UINT16) { }	// Bar * 100
+DECLARE_FIELD(TANK_SUMMARY, volume_used, UINT32) { }	// L * 100
 
 // EVENT
 DECLARE_FIELD(EVENT, event, ENUM)
@@ -600,6 +871,20 @@ DECLARE_FIELD(EVENT, unknown, UINT32)
 {
 	garmin->record_data.event_unknown = data;
 }
+DECLARE_FIELD(EVENT, tank_pressure_reserve, UINT32Z) { }	// sensor ID
+DECLARE_FIELD(EVENT, tank_pressure_critical, UINT32Z) { }	// sensor ID
+DECLARE_FIELD(EVENT, tank_pressure_lost, UINT32Z) { }		// sensor ID
+
+// "Field description" (for developer fields)
+DECLARE_FIELD(FIELD_DESCRIPTION, data_index, UINT8) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, field_definition, UINT8) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, base_type, UINT8) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, name, STRING) { } 		// "Depth"
+DECLARE_FIELD(FIELD_DESCRIPTION, scale, UINT8) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, offset, SINT8) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, unit, STRING) { }		// "feet"
+DECLARE_FIELD(FIELD_DESCRIPTION, original_mesg, UINT16) { }
+DECLARE_FIELD(FIELD_DESCRIPTION, original_field, UINT8) { }
 
 struct msg_desc {
 	unsigned char maxfield;
@@ -613,7 +898,7 @@ struct msg_desc {
 	static const struct msg_desc name##_msg_desc
 
 DECLARE_MESG(FILE) = {
-	.maxfield = 8,
+	.maxfield = 9,
 	.field = {
 		SET_FIELD(FILE, 0, file_type, ENUM),
 		SET_FIELD(FILE, 1, manufacturer, UINT16),
@@ -622,6 +907,7 @@ DECLARE_MESG(FILE) = {
 		SET_FIELD(FILE, 4, creation_time, UINT32),
 		SET_FIELD(FILE, 5, number, UINT16),
 		SET_FIELD(FILE, 7, other_time, UINT32),
+		SET_FIELD(FILE, 8, product_name, STRING),
 	}
 };
 
@@ -633,12 +919,13 @@ DECLARE_MESG(DEVICE_SETTINGS) = {
 	}
 };
 DECLARE_MESG(USER_PROFILE) = { };
+DECLARE_MESG(HRM_PROFILE) = { };
 DECLARE_MESG(ZONES_TARGET) = { };
 
 DECLARE_MESG(SPORT) = {
 	.maxfield = 2,
 	.field = {
-		SET_FIELD(SPORT, 1, sub_sport, ENUM),	// 53 - 57 are dive activities
+		SET_FIELD(SPORT, 1, sub_sport, ENUM),	// 53 - 57 and 63 are dive activities
 	}
 };
 
@@ -673,14 +960,17 @@ DECLARE_MESG(LAP) = {
 };
 
 DECLARE_MESG(RECORD) = {
-	.maxfield = 99,
+	.maxfield = 128,
 	.field = {
 		SET_FIELD(RECORD, 0, position_lat, SINT32),	// 180 deg / 2**31
 		SET_FIELD(RECORD, 1, position_long, SINT32),	// 180 deg / 2**31
 		SET_FIELD(RECORD, 2, altitude, UINT16),		// 5 *m + 500 ?
 		SET_FIELD(RECORD, 3, heart_rate, UINT8),	// bpm
+		SET_FIELD(RECORD, 4, cadence, UINT8),		// cadence
 		SET_FIELD(RECORD, 5, distance, UINT32),		// Distance in 100 * m? WTF?
+		SET_FIELD(RECORD, 6, speed, UINT16),		// m/s? Who knows..
 		SET_FIELD(RECORD, 13, temperature, SINT8),	// degrees C
+		SET_FIELD(RECORD, 53, fract_cadence, UINT8),	// fractional cadence
 		SET_FIELD(RECORD, 91, abs_pressure, UINT32),	// Pascal
 		SET_FIELD(RECORD, 92, depth, UINT32),		// mm
 		SET_FIELD(RECORD, 93, next_stop_depth, UINT32),	// mm
@@ -689,21 +979,27 @@ DECLARE_MESG(RECORD) = {
 		SET_FIELD(RECORD, 96, ndl, UINT32),		// s
 		SET_FIELD(RECORD, 97, cns_load, UINT8),		// percent
 		SET_FIELD(RECORD, 98, n2_load, UINT16),		// percent
+		SET_FIELD(RECORD, 123, air_time_remaining, UINT32),	// seconds
+		SET_FIELD(RECORD, 124, pressure_sac, UINT16),	// 100 * bar/min/pressure
+		SET_FIELD(RECORD, 125, volume_sac, UINT16),	// 100 * l/min/pressure
+		SET_FIELD(RECORD, 126, rmv, UINT16),		// 100 * l/min
+		SET_FIELD(RECORD, 127, ascent_rate, SINT32),	// mm/s (negative is down)
 	}
 };
 
 DECLARE_MESG(DIVE_GAS) = {
-	.maxfield = 3,
+	.maxfield = 4,
 	.field = {
 		// This uses a "message index" field to set the gas index
 		SET_FIELD(DIVE_GAS, 0, helium, UINT8),
 		SET_FIELD(DIVE_GAS, 1, oxygen, UINT8),
 		SET_FIELD(DIVE_GAS, 2, status, ENUM),
+		SET_FIELD(DIVE_GAS, 3, type, ENUM),
 	}
 };
 
 DECLARE_MESG(DIVE_SUMMARY) = {
-	.maxfield = 12,
+	.maxfield = 15,
 	.field = {
 		SET_FIELD(DIVE_SUMMARY, 2, avg_depth, UINT32),		// mm
 		SET_FIELD(DIVE_SUMMARY, 3, max_depth, UINT32),		// mm
@@ -715,17 +1011,23 @@ DECLARE_MESG(DIVE_SUMMARY) = {
 		SET_FIELD(DIVE_SUMMARY, 9, o2_toxicity, UINT16),	// OTUs
 		SET_FIELD(DIVE_SUMMARY, 10, dive_number, UINT32),
 		SET_FIELD(DIVE_SUMMARY, 11, bottom_time, UINT32),	// ms
+		SET_FIELD(DIVE_SUMMARY, 12, avg_pressure_sac, UINT16),	// 100 * bar/min/pressure
+		SET_FIELD(DIVE_SUMMARY, 13, avg_volume_sac, UINT16),	// 100 * L/min/pressure
+		SET_FIELD(DIVE_SUMMARY, 14, avg_rmv, UINT16),		// 100 * L/min
 	}
 };
 
 DECLARE_MESG(EVENT) = {
-	.maxfield = 16,
+	.maxfield = 74,
 	.field = {
 		SET_FIELD(EVENT, 0, event, ENUM),
 		SET_FIELD(EVENT, 1, type, ENUM),
 		SET_FIELD(EVENT, 3, data, UINT32),
 		SET_FIELD(EVENT, 4, event_group, UINT8),
 		SET_FIELD(EVENT, 15, unknown, UINT32),
+		SET_FIELD(EVENT, 71, tank_pressure_reserve, UINT32Z),	// sensor ID
+		SET_FIELD(EVENT, 72, tank_pressure_critical, UINT32Z),	// sensor ID
+		SET_FIELD(EVENT, 73, tank_pressure_lost, UINT32Z),	// sensor ID
 	}
 };
 
@@ -739,11 +1041,23 @@ DECLARE_MESG(DEVICE_INFO) = {
 	}
 };
 
-DECLARE_MESG(ACTIVITY) = { };
+DECLARE_MESG(ACTIVITY) = {
+	.maxfield = 7,
+	.field = {
+		SET_FIELD(ACTIVITY, 0, total_timer_time, UINT32),
+		SET_FIELD(ACTIVITY, 1, num_sessions, UINT16),
+		SET_FIELD(ACTIVITY, 2, type, ENUM),
+		SET_FIELD(ACTIVITY, 3, event, ENUM),
+		SET_FIELD(ACTIVITY, 4, event_type, ENUM),
+		SET_FIELD(ACTIVITY, 5, local_timestamp, UINT32),
+		SET_FIELD(ACTIVITY, 6, event_group, UINT8),
+	}
+};
+
 DECLARE_MESG(FILE_CREATOR) = { };
 
 DECLARE_MESG(DIVE_SETTINGS) = {
-	.maxfield = 21,
+	.maxfield = 28,
 	.field = {
 		SET_FIELD(DIVE_SETTINGS, 0, name, STRING),		// Unused except in dive plans
 		SET_FIELD(DIVE_SETTINGS, 1, model, ENUM),		// model - Always 0 for Buhlmann ZHL-16C
@@ -765,10 +1079,65 @@ DECLARE_MESG(DIVE_SETTINGS) = {
 		SET_FIELD(DIVE_SETTINGS, 17, repeat_dive_interval, UINT16), // seconds between surfacing and when the watch stops and saves your dive. Must be at least 20.
 		SET_FIELD(DIVE_SETTINGS, 18, safety_stop_time, UINT16),	// seconds; 180 or 300 are acceptable values
 		SET_FIELD(DIVE_SETTINGS, 19, heart_rate_source_type, ENUM), // For now all you need to know is source_type_local means WHR and source_type_antplus means strap data or off. (We're reusing existing infrastructure here which is why this is complex.)
-		SET_FIELD(DIVE_SETTINGS, 20, hear_rate_device_type, UINT8), // device type depending on heart_rate_source_type (ignorable for now)
+		SET_FIELD(DIVE_SETTINGS, 20, heart_rate_device_type, UINT8), // device type depending on heart_rate_source_type (ignorable for now)
+		SET_FIELD(DIVE_SETTINGS, 22, setpoint_low_switch_mode, ENUM), // CCR low setpoint switching mode
+		SET_FIELD(DIVE_SETTINGS, 23, setpoint_low_cbar, UINT8), // CCR low setpoint [centibar]
+		SET_FIELD(DIVE_SETTINGS, 24, setpoint_low_switch_depth_mm, UINT32), // CCR low setpoint switch depth [mm]
+		SET_FIELD(DIVE_SETTINGS, 25, setpoint_high_switch_mode, ENUM), // CCR high setpoint switching mode
+		SET_FIELD(DIVE_SETTINGS, 26, setpoint_high_cbar, UINT8), // CCR high setpoint [centibar]
+		SET_FIELD(DIVE_SETTINGS, 27, setpoint_high_switch_depth_mm, UINT32), // CCR high setpoint switch depth [mm]
 	}
 };
 DECLARE_MESG(DIVE_ALARM) = { };
+
+DECLARE_MESG(SENSOR_PROFILE) = {
+	.maxfield = 79,
+	.field = {
+		SET_FIELD(SENSOR_PROFILE, 0, ant_channel_id, UINT32Z),	// derived from the number engraved on the side
+		SET_FIELD(SENSOR_PROFILE, 2, name, STRING),
+		SET_FIELD(SENSOR_PROFILE, 3, enabled, ENUM),
+		SET_FIELD(SENSOR_PROFILE, 52, sensor_type, UINT8),	// 28 is tank pod
+		SET_FIELD(SENSOR_PROFILE, 74, pressure_units, ENUM),	//  0 is PSI, 1 is KPA (unused), 2 is Bar
+		SET_FIELD(SENSOR_PROFILE, 75, rated_pressure, UINT16),
+		SET_FIELD(SENSOR_PROFILE, 76, reserve_pressure, UINT16),
+		SET_FIELD(SENSOR_PROFILE, 77, volume, UINT16),		// CuFt * 10 (PSI) or L * 10 (Bar)
+		SET_FIELD(SENSOR_PROFILE, 78, used_for_gas_rate, ENUM),	// was used for SAC calculations?
+	}
+};
+
+DECLARE_MESG(TANK_UPDATE) = {
+	.maxfield = 2,
+	.field = {
+		SET_FIELD(TANK_UPDATE, 0, sensor, UINT32Z),		// sensor ID
+		SET_FIELD(TANK_UPDATE, 1, pressure, UINT16),		// pressure in Bar * 100
+	}
+};
+
+DECLARE_MESG(TANK_SUMMARY) = {
+	.maxfield = 4,
+	.field = {
+		SET_FIELD(TANK_SUMMARY, 0, sensor, UINT32Z),		// sensor ID
+		SET_FIELD(TANK_SUMMARY, 1, start_pressure, UINT16),	// Bar * 100
+		SET_FIELD(TANK_SUMMARY, 2, end_pressure, UINT16),	// Bar * 100
+		SET_FIELD(TANK_SUMMARY, 3, volume_used, UINT32),	// L * 100
+	}
+};
+
+DECLARE_MESG(FIELD_DESCRIPTION) = {
+	.maxfield = 16,
+	.field = {
+		SET_FIELD(FIELD_DESCRIPTION, 0, data_index, UINT8),
+		SET_FIELD(FIELD_DESCRIPTION, 1, field_definition, UINT8),
+		SET_FIELD(FIELD_DESCRIPTION, 2, base_type, UINT8),
+		SET_FIELD(FIELD_DESCRIPTION, 3, name, STRING),		// "Depth"
+		SET_FIELD(FIELD_DESCRIPTION, 6, scale, UINT8),
+		SET_FIELD(FIELD_DESCRIPTION, 7, offset, SINT8),
+		SET_FIELD(FIELD_DESCRIPTION, 8, unit, STRING),		// "feet"
+		// Some kind of pointer to original field?
+		SET_FIELD(FIELD_DESCRIPTION, 14, original_mesg, UINT16),
+		SET_FIELD(FIELD_DESCRIPTION, 15, original_field, UINT8),
+	}
+};
 
 // Unknown global message ID's..
 DECLARE_MESG(WTF_13) = { };
@@ -790,6 +1159,7 @@ static const struct {
 	SET_MESG(  0, FILE),
 	SET_MESG(  2, DEVICE_SETTINGS),
 	SET_MESG(  3, USER_PROFILE),
+	SET_MESG(  4, HRM_PROFILE),
 	SET_MESG(  7, ZONES_TARGET),
 	SET_MESG( 12, SPORT),
 	SET_MESG( 13, WTF_13),
@@ -808,12 +1178,18 @@ static const struct {
 	SET_MESG(140, WTF_140),
 	SET_MESG(141, WTF_141),
 
+	SET_MESG(147, SENSOR_PROFILE),
+
+	SET_MESG(206, FIELD_DESCRIPTION),
+
 	SET_MESG(216, WTF_216),
 	SET_MESG(233, WTF_233),
 	SET_MESG(258, DIVE_SETTINGS),
 	SET_MESG(259, DIVE_GAS),
 	SET_MESG(262, DIVE_ALARM),
 	SET_MESG(268, DIVE_SUMMARY),
+	SET_MESG(319, TANK_UPDATE),
+	SET_MESG(323, TANK_SUMMARY),
 };
 
 #define MSG_NAME_LEN 16
@@ -838,14 +1214,6 @@ static const struct msg_desc *lookup_msg_desc(unsigned short msg, int local, con
 	snprintf(name, MSG_NAME_LEN, "msg-%d", msg);
 	*namep = name;
 	return desc;
-}
-
-static int traverse_compressed(struct garmin_parser_t *garmin,
-	const unsigned char *data, unsigned int size,
-	unsigned char type, unsigned int time)
-{
-	fprintf(stderr, "Compressed record for local type %d:\n", type);
-	return -1;
 }
 
 static int all_data_inval(const unsigned char *data, int base_type, int len)
@@ -906,9 +1274,12 @@ static void unknown_field(struct garmin_parser_t *garmin, const unsigned char *d
 			data += base_size;
 			len -= base_size;
 		}
+
+		/* Avoid debug printing limit */
+		len = sizeof(buffer);
 	}
 
-	DEBUG(garmin->base.context, "%s/%d %s '%s'", msg_name, field_nr, base_type_info[base_type].type_name, str);
+	DEBUG(garmin->base.context, "%s/%d %s '%.*s'", msg_name, field_nr, base_type_info[base_type].type_name, len, str);
 }
 
 
@@ -936,40 +1307,23 @@ static int traverse_regular(struct garmin_parser_t *garmin,
 
 		if (!len) {
 			ERROR(garmin->base.context, "field with zero length\n");
-			return -1;
+			return total_len + size;
 		}
 
 		if (size < len) {
 			ERROR(garmin->base.context, "Data traversal size bigger than remaining data (%d vs %d)\n", len, size);
-			return -1;
+			return total_len + size;
 		}
 
 		if (base_type > 16) {
 			ERROR(garmin->base.context, "Unknown base type %d\n", base_type);
-			data += size;
-			len -= size;
-			total_len += size;
-			continue;
+			return total_len + size;
 		}
 		base_size = base_type_info[base_type].type_size;
 		if (len % base_size) {
 			ERROR(garmin->base.context, "Data traversal size not a multiple of base size (%d vs %d)\n", len, base_size);
 			return -1;
 		}
-		// String
-		if (base_type == 7) {
-			int string_len = strnlen(data, size);
-			if (string_len >= size) {
-				ERROR(garmin->base.context, "Data traversal string bigger than remaining data\n");
-				return -1;
-			}
-			if (len <= string_len) {
-				ERROR(garmin->base.context, "field length %d, string length %d\n", len, string_len + 1);
-				return -1;
-			}
-		}
-
-
 
 		// Certain field numbers have fixed meaning across all messages
 		switch (field_nr) {
@@ -994,6 +1348,31 @@ static int traverse_regular(struct garmin_parser_t *garmin,
 			unknown_field(garmin, data, msg_name, field_nr, base_type, len);
 		}
 
+		data += len;
+		total_len += len;
+		size -= len;
+	}
+
+	for (int i = 0; i < desc->devfields; i++) {
+		int desc_idx = i + desc->nrfields;
+		const unsigned char *field = desc->fields[desc_idx];
+		unsigned int field_nr = field[0];
+		unsigned int len = field[1];
+		unsigned int type = field[2];
+
+		DEBUG(garmin->base.context, "Developer field %d %02x type %02x", i, field_nr, type);
+
+		if (!len) {
+			ERROR(garmin->base.context, "  developer field with zero length\n");
+			return -1;
+		}
+
+		if (size < len) {
+			ERROR(garmin->base.context, "  developer field bigger than remaining data (%d vs %d)\n", len, size);
+			return -1;
+		}
+
+		HEXDUMP(garmin->base.context, DC_LOGLEVEL_DEBUG, "data", data, len);
 		data += len;
 		total_len += len;
 		size -= len;
@@ -1032,18 +1411,13 @@ static int traverse_definition(struct garmin_parser_t *garmin,
 	struct type_desc *desc = garmin->type_desc + type;
 	int fields, devfields, len;
 
-	msg = array_uint16_le(data+2);
+	// data[1] tells us if this is big or little endian
+	garmin->is_big_endian = data[1] != 0;
+	msg = garmin_value(garmin, data + 2, 2);
 	desc->msg_desc = lookup_msg_desc(msg, type, &desc->msg_name);
 	fields = data[4];
-
-	DEBUG(garmin->base.context, "Define local type %d: %02x %02x %04x %02x %s",
-		type, data[0], data[1], msg, fields, desc->msg_name);
-
-	if (data[1]) {
-		ERROR(garmin->base.context, "Only handling little-endian definitions\n");
-		return -1;
-	}
-
+	DEBUG(garmin->base.context, "Define local type %d: %02x %s %04x %02x %s",
+		type, data[0], data[1] ? "big-endian" : "little-endian", msg, fields, desc->msg_name);
 	if (fields > MAXFIELDS) {
 		ERROR(garmin->base.context, "Too many fields in description: %d (max %d)\n", fields, MAXFIELDS);
 		return -1;
@@ -1051,18 +1425,40 @@ static int traverse_definition(struct garmin_parser_t *garmin,
 	desc->nrfields = fields;
 	len = 5 + fields*3;
 	devfields = 0;
-	if (record & 0x20) {
-		devfields = data[len];
-		len += 1 + devfields*3;
-		ERROR(garmin->base.context, "NO support for developer fields yet\n");
-		return -1;
-	}
 
 	for (int i = 0; i < fields; i++) {
 		unsigned char *field = desc->fields[i];
 		memcpy(field, data + (5+i*3), 3);
 		DEBUG(garmin->base.context, "  %d: %02x %02x %02x", i, field[0], field[1], field[2]);
 	}
+
+	data += len;
+
+	/* Developer fields after the regular ones */
+	if (record & 0x20) {
+		devfields = data[0];
+		DEBUG(garmin->base.context, "Developer field (rec=%02x len=%d, devfields=%d)",
+			record, len, devfields);
+
+		/*
+		 * one byte of dev field numbers, each three bytes in size
+		 * (number/size/index)
+		 */
+		len += 1 + 3*devfields;
+
+		for (int i = 0; i < devfields; i++) {
+			int idx = fields + i;
+			unsigned char *field = desc->fields[idx];
+			if (idx > MAXFIELDS) {
+				ERROR(garmin->base.context, "Too many dev fields in description: %d+%d (max %d)\n", fields, i, MAXFIELDS);
+				return -1;
+			}
+			memcpy(field, data + (1+i*3), 3);
+			DEBUG(garmin->base.context, "  %d: %02x %02x %02x", i, field[0], field[1], field[2]);
+		}
+	}
+
+	desc->devfields = devfields;
 
 	return len;
 }
@@ -1084,7 +1480,7 @@ traverse_data(struct garmin_parser_t *garmin)
 	if (len < FIT_NAME_SIZE)
 		return DC_STATUS_IO;
 
-	DEBUG(garmin->base.context, "file %s", data);
+	DEBUG(garmin->base.context, "file %.*s", FIT_NAME_SIZE, data);
 
 	data += FIT_NAME_SIZE;
 	len -= FIT_NAME_SIZE;
@@ -1095,15 +1491,18 @@ traverse_data(struct garmin_parser_t *garmin)
 
 	hdrsize = data[0];
 	protocol = data[1];
-	profile = array_uint16_le(data+2);
+	profile = array_uint16_le(data+2);  // these two fields are always little endian
 	datasize = array_uint32_le(data+4);
-	if (memcmp(data+8, ".FIT", 4))
+	if (memcmp(data+8, ".FIT", 4)) {
+		DEBUG(garmin->base.context, " missing .FIT marker");
 		return DC_STATUS_IO;
-	if (hdrsize < 12 || datasize > len || datasize + hdrsize + 2 > len)
+	}
+	if (hdrsize < 12 || datasize > len || datasize + hdrsize + 2 > len) {
+		DEBUG(garmin->base.context, " inconsistent size information hdrsize %d datasize %d len %d", hdrsize, datasize, len);
 		return DC_STATUS_IO;
-
-	garmin->protocol = protocol;
-	garmin->profile = profile;
+	}
+	garmin->dive.protocol = protocol;
+	garmin->dive.profile = profile;
 
 	data += hdrsize;
 	time = 0;
@@ -1125,10 +1524,15 @@ traverse_data(struct garmin_parser_t *garmin)
 				newtime += 0x20;
 			time = newtime;
 
-			len = traverse_compressed(garmin, data, datasize, type, time);
+			// Compressed records are like normal records
+			// with that added relative timestamp
+			DEBUG(garmin->base.context, "Compressed record for type %d", type);
+			parse_ANY_timestamp(garmin, time);
+			len = traverse_regular(garmin, data, datasize, type, &time);
 		} else if (record & 0x40) {	// Definition record?
 			len = traverse_definition(garmin, data, datasize, record);
 		} else {			// Normal data record
+			DEBUG(garmin->base.context, "Regular record for type %d", record);
 			len = traverse_regular(garmin, data, datasize, record, &time);
 		}
 		if (len <= 0 || len > datasize)
@@ -1140,6 +1544,7 @@ traverse_data(struct garmin_parser_t *garmin)
 		if (garmin->record_data.pending)
 			flush_pending_record(garmin);
 	}
+
 	return DC_STATUS_SUCCESS;
 }
 
@@ -1188,11 +1593,11 @@ garmin_parser_is_dive (dc_parser_t *abstract, const unsigned char *data, unsigne
 	garmin_parser_t *garmin = (garmin_parser_t *) abstract;
 
 	if (devinfo_p) {
-		devinfo_p->firmware = garmin->firmware;
-		devinfo_p->serial = garmin->serial;
-		devinfo_p->model = garmin->product;
+		devinfo_p->firmware = garmin->dive.firmware;
+		devinfo_p->serial = garmin->dive.serial;
+		devinfo_p->model = garmin->dive.product;
 	}
-	switch (garmin->sub_sport) {
+	switch (garmin->dive.sub_sport) {
 	case 53:	// Single-gas
 	case 54:	// Multi-gas
 	case 55:	// Gauge
@@ -1210,6 +1615,11 @@ garmin_parser_is_dive (dc_parser_t *abstract, const unsigned char *data, unsigne
 	}
 }
 
+static void add_sensor_string(garmin_parser_t *garmin, const char *desc, const struct garmin_sensor *sensor)
+{
+	dc_field_add_string_fmt(&garmin->cache, desc, "%x", sensor->sensor_id);
+}
+
 static dc_status_t
 garmin_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsigned int size)
 {
@@ -1218,9 +1628,19 @@ garmin_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsign
 	/* Walk the data once without a callback to set up the core fields */
 	garmin->callback = NULL;
 	garmin->userdata = NULL;
+	memset(&garmin->gps, 0, sizeof(garmin->gps));
+	memset(&garmin->dive, 0, sizeof(garmin->dive));
 	memset(&garmin->cache, 0, sizeof(garmin->cache));
 
 	traverse_data(garmin);
+
+	// Device information
+	if (garmin->dive.serial)
+		dc_field_add_string_fmt(&garmin->cache, "Serial", "%u", garmin->dive.serial);
+	if (garmin->dive.firmware)
+		dc_field_add_string_fmt(&garmin->cache, "Firmware", "%u.%02u",
+			garmin->dive.firmware / 100, garmin->dive.firmware % 100);
+
 	// These seem to be the "real" GPS dive coordinates
 	add_gps_string(garmin, "GPS1", &garmin->gps.SESSION.entry);
 	add_gps_string(garmin, "GPS2", &garmin->gps.SESSION.exit);
@@ -1235,6 +1655,45 @@ garmin_parser_set_data (dc_parser_t *abstract, const unsigned char *data, unsign
 
 	add_gps_string(garmin, "Record GPS", &garmin->gps.RECORD);
 
+	// We have no idea about gas mixes vs tanks
+	for (int i = 0; i < garmin->dive.nr_sensor; i++) {
+		// DC_ASSIGN_IDX(garmin->cache, tankinfo, i, ..);
+		// DC_ASSIGN_IDX(garmin->cache, tanksize, i, ..);
+		// DC_ASSIGN_IDX(garmin->cache, tankworkingpressure, i, ..);
+	}
+
+	// Hate hate hate gasmix vs tank counts.
+	//
+	// There's no way to match them up unless they are an identity
+	// mapping, so having two different ones doesn't actually work.
+	if (garmin->dive.nr_sensor > garmin->cache.GASMIX_COUNT) {
+		DC_ASSIGN_FIELD(garmin->cache, GASMIX_COUNT, garmin->dive.nr_sensor);
+		garmin->cache.initialized |= 1 << DC_FIELD_TANK_COUNT;
+	}
+
+	for (int i = 0; i < garmin->dive.nr_sensor; i++) {
+		static const char *name[] = { "Sensor 1", "Sensor 2", "Sensor 3", "Sensor 4", "Sensor 5" };
+		add_sensor_string(garmin, name[i], garmin->dive.sensor+i);
+	}
+
+	if (garmin->cache.DIVEMODE == DC_DIVEMODE_CCR) {
+		dc_field_add_string_fmt(&garmin->cache, "Setpoint low [bar]", "%u.%02u",
+			garmin->dive.setpoint_low_cbar / 100, (garmin->dive.setpoint_low_cbar % 100));
+		dc_field_add_string(&garmin->cache, "Setpoint low mode", garmin->dive.setpoint_low_switch_mode ? "auto" : "manual");
+		if (garmin->dive.setpoint_low_switch_mode) {
+			dc_field_add_string_fmt(&garmin->cache, "Setpoint low auto switch depth [m]", "%u.%01u",
+				garmin->dive.setpoint_low_switch_depth_mm / 1000, (garmin->dive.setpoint_low_switch_depth_mm % 1000) / 100);
+		}
+
+		dc_field_add_string_fmt(&garmin->cache, "Setpoint high [bar]", "%u.%02u",
+			garmin->dive.setpoint_high_cbar / 100, (garmin->dive.setpoint_high_cbar % 100));
+		dc_field_add_string(&garmin->cache, "Setpoint high mode", garmin->dive.setpoint_high_switch_mode ? "auto" : "manual");
+		if (garmin->dive.setpoint_high_switch_mode) {
+			dc_field_add_string_fmt(&garmin->cache, "Setpoint high auto switch depth [m]", "%u.%01u",
+				garmin->dive.setpoint_high_switch_depth_mm / 1000, (garmin->dive.setpoint_high_switch_depth_mm % 1000) / 100);
+		}
+	}
+
 	return DC_STATUS_SUCCESS;
 }
 
@@ -1243,11 +1702,23 @@ static dc_status_t
 garmin_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime)
 {
 	garmin_parser_t *garmin = (garmin_parser_t *) abstract;
-	dc_ticks_t time = 631065600 + (dc_ticks_t) garmin->time;
+	dc_ticks_t time = 631065600 + (dc_ticks_t) garmin->dive.time;
+	int timezone = DC_TIMEZONE_NONE;
 
 	// Show local time (time_offset)
-	dc_datetime_gmtime(datetime, time + garmin->time_offset);
-	datetime->timezone = DC_TIMEZONE_NONE;
+	dc_datetime_gmtime(datetime, time + garmin->dive.time_offset);
+
+	/* See if we might have a valid timezone offset */
+	if (garmin->dive.time_offset || garmin->dive.utc_offset) {
+		int offset = garmin->dive.time_offset - garmin->dive.utc_offset;
+
+		/* 15-minute (900-second) offsets are real */
+		if ((offset % 900) == 0 &&
+		    offset >= -12*60*60 &&
+		    offset <= 14*60*60)
+			timezone = offset;
+	}
+	datetime->timezone = timezone;
 
 	return DC_STATUS_SUCCESS;
 }
@@ -1269,42 +1740,7 @@ garmin_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned i
 {
 	garmin_parser_t *garmin = (garmin_parser_t *) abstract;
 
-	if (!value)
-		return DC_STATUS_INVALIDARGS;
-	if (type == DC_FIELD_TANK_COUNT)
-		type = DC_FIELD_GASMIX_COUNT;
-
-	/* This whole sequence should be standardized */
-	if (!(garmin->cache.initialized & (1 << type)))
-		return DC_STATUS_UNSUPPORTED;
-
-	switch (type) {
-	case DC_FIELD_DIVETIME:
-		return DC_FIELD_VALUE(garmin->cache, value, DIVETIME);
-	case DC_FIELD_MAXDEPTH:
-		return DC_FIELD_VALUE(garmin->cache, value, MAXDEPTH);
-	case DC_FIELD_AVGDEPTH:
-		return DC_FIELD_VALUE(garmin->cache, value, AVGDEPTH);
-	case DC_FIELD_GASMIX_COUNT:
-		return DC_FIELD_VALUE(garmin->cache, value, GASMIX_COUNT);
-	case DC_FIELD_GASMIX:
-		if (flags >= MAXGASES)
-			return DC_STATUS_UNSUPPORTED;
-		return DC_FIELD_INDEX(garmin->cache, value, GASMIX, flags);
-	case DC_FIELD_SALINITY:
-		return DC_FIELD_VALUE(garmin->cache, value, SALINITY);
-	case DC_FIELD_ATMOSPHERIC:
-		return DC_STATUS_UNSUPPORTED;
-	case DC_FIELD_DIVEMODE:
-		return DC_STATUS_UNSUPPORTED;
-	case DC_FIELD_TANK:
-		return DC_STATUS_UNSUPPORTED;
-	case DC_FIELD_STRING:
-		return dc_field_get_string(&garmin->cache, flags, (dc_field_string_t *)value);
-	default:
-		return DC_STATUS_UNSUPPORTED;
-	}
-	return DC_STATUS_SUCCESS;
+	return dc_field_get(&garmin->cache, type, flags, value);
 }
 
 static dc_status_t

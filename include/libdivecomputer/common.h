@@ -108,12 +108,26 @@ typedef enum dc_family_t {
 	DC_FAMILY_COCHRAN_COMMANDER = (14 << 16),
 	/* Tecdiving */
 	DC_FAMILY_TECDIVING_DIVECOMPUTEREU = (15 << 16),
-	/* Garmin */
-	DC_FAMILY_GARMIN = (16 << 16),
-	/* Deepblu */
-	DC_FAMILY_DEEPBLU = (17 << 16),
 	/* McLean */
-	DC_FAMILY_MCLEAN_EXTREME = (18 << 16),
+	DC_FAMILY_MCLEAN_EXTREME = (16 << 16),
+	/* Liquivision */
+	DC_FAMILY_LIQUIVISION_LYNX = (17 << 16),
+	/* Sporasub */
+	DC_FAMILY_SPORASUB_SP2 = (18 << 16),
+	/* Deep Six */
+	DC_FAMILY_DEEPSIX_EXCURSION = (19 << 16),
+	/* Seac Screen */
+	DC_FAMILY_SEAC_SCREEN = (20 << 16),
+	/* Deepblu Cosmiq */
+	DC_FAMILY_DEEPBLU_COSMIQ = (21 << 16),
+	/* Oceans S1 */
+	DC_FAMILY_OCEANS_S1 = (22 << 16),
+	/* Divesoft Freedom */
+	DC_FAMILY_DIVESOFT_FREEDOM = (23 << 16),
+
+	// Not merged upstream yet
+	/* Garmin */
+	DC_FAMILY_GARMIN = (100 << 16),
 } dc_family_t;
 
 #ifdef __cplusplus

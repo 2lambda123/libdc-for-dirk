@@ -93,7 +93,7 @@ cressi_goa_device_send (cressi_goa_device_t *device, unsigned char cmd, const un
 	if (size) {
 		memcpy (packet + 5, data, size);
 	}
-	crc = checksum_crc16_ccitt (packet + 3, size + 2, 0x000);
+	crc = checksum_crc16_ccitt (packet + 3, size + 2, 0x000, 0x0000);
 	packet[5 + size + 0] = (crc     ) & 0xFF; // Low
 	packet[5 + size + 1] = (crc >> 8) & 0xFF; // High
 	packet[5 + size + 2] = TRAILER;
@@ -155,7 +155,7 @@ cressi_goa_device_receive (cressi_goa_device_t *device, unsigned char data[], un
 
 	// Verify the checksum of the packet.
 	unsigned short crc = array_uint16_le (packet + length + 5);
-	unsigned short ccrc = checksum_crc16_ccitt (packet + 3, length + 2, 0x0000);
+	unsigned short ccrc = checksum_crc16_ccitt (packet + 3, length + 2, 0x0000, 0x0000);
 	if (crc != ccrc) {
 		ERROR (abstract->context, "Unexpected answer checksum.");
 		return DC_STATUS_PROTOCOL;
@@ -203,7 +203,7 @@ cressi_goa_device_download (cressi_goa_device_t *device, dc_buffer_t *buffer, dc
 
 		// Verify the checksum of the packet.
 		unsigned short crc = array_uint16_le (packet + sizeof(packet) - 2);
-		unsigned short ccrc = checksum_crc16_ccitt (packet + 3, sizeof(packet) - 5, 0x0000);
+		unsigned short ccrc = checksum_crc16_ccitt (packet + 3, sizeof(packet) - 5, 0x0000, 0x0000);
 		if (crc != ccrc) {
 			ERROR (abstract->context, "Unexpected answer checksum.");
 			return DC_STATUS_PROTOCOL;
@@ -485,7 +485,19 @@ cressi_goa_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, v
 			goto error_free_dive;
 		}
 
-		if (callback && !callback(dive_data, dive_size, dive_data + FP_OFFSET - 5, sizeof(device->fingerprint), userdata))
+		// Those 5 extra bytes contain the dive mode, which is required for
+		// parsing the dive data. Therefore, insert all 5 bytes again. The
+		// remaining 4 bytes appear to be some 32 bit address.
+		if (!dc_buffer_insert (dive, 2, logbook_data + offset + 2, 5)) {
+			ERROR (abstract->context, "Out of memory.");
+			status = DC_STATUS_NOMEMORY;
+			goto error_free_dive;
+		}
+
+		dive_data = dc_buffer_get_data (dive);
+		dive_size = dc_buffer_get_size (dive);
+
+		if (callback && !callback(dive_data, dive_size, dive_data + FP_OFFSET, sizeof(device->fingerprint), userdata))
 			break;
 	}
 

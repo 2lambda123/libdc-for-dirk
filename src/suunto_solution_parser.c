@@ -47,6 +47,9 @@ static const dc_parser_vtable_t suunto_solution_parser_vtable = {
 	sizeof(suunto_solution_parser_t),
 	DC_FAMILY_SUUNTO_SOLUTION,
 	suunto_solution_parser_set_data, /* set_data */
+	NULL, /* set_clock */
+	NULL, /* set_atmospheric */
+	NULL, /* set_density */
 	NULL, /* datetime */
 	suunto_solution_parser_get_field, /* fields */
 	suunto_solution_parser_samples_foreach, /* samples_foreach */
@@ -110,10 +113,10 @@ suunto_solution_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, u
 		unsigned int depth = 0, maxdepth = 0;
 		unsigned int offset = 3;
 		while (offset < size && data[offset] != 0x80) {
-			unsigned char value = data[offset++];
-			if (value < 0x7e || value > 0x82) {
-				depth += (signed char) value;
-				if (value == 0x7D || value == 0x83) {
+			unsigned char raw = data[offset++];
+			if (raw < 0x7e || raw > 0x82) {
+				depth += (signed char) raw;
+				if (raw == 0x7D || raw == 0x83) {
 					if (offset + 1 > size)
 						return DC_STATUS_DATAFORMAT;
 					depth += (signed char) data[offset++];

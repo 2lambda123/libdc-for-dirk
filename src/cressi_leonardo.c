@@ -84,7 +84,7 @@ cressi_leonardo_make_ascii (const unsigned char raw[], unsigned int rsize, unsig
 	array_convert_bin2hex (raw, rsize, ascii + 1, 2 * rsize);
 
 	// Checksum
-	unsigned short crc = checksum_crc16_ccitt (ascii + 1, 2 * rsize, 0xffff);
+	unsigned short crc = checksum_crc16_ccitt (ascii + 1, 2 * rsize, 0xffff, 0x0000);
 	unsigned char checksum[] = {
 			(crc >> 8) & 0xFF,  // High
 			(crc     ) & 0xFF}; // Low
@@ -129,7 +129,7 @@ cressi_leonardo_packet (cressi_leonardo_device_t *device, const unsigned char co
 
 	// Verify the checksum of the packet.
 	unsigned short crc = array_uint16_be (checksum);
-	unsigned short ccrc = checksum_crc16_ccitt (answer + 1, asize - 6, 0xffff);
+	unsigned short ccrc = checksum_crc16_ccitt (answer + 1, asize - 6, 0xffff, 0x0000);
 	if (crc != ccrc) {
 		ERROR (abstract->context, "Unexpected answer checksum.");
 		return DC_STATUS_PROTOCOL;
@@ -372,11 +372,18 @@ cressi_leonardo_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 
 	// Verify the checksum.
 	unsigned int csum1 = array_uint16_be (checksum);
-	unsigned int csum2 = checksum_crc16_ccitt (data, SZ_MEMORY, 0xffff);
+	unsigned int csum2 = checksum_crc16_ccitt (data, SZ_MEMORY, 0xffff, 0x0000);
 	if (csum1 != csum2) {
 		ERROR (abstract->context, "Unexpected answer bytes.");
 		return DC_STATUS_PROTOCOL;
 	}
+
+	// Emit a device info event.
+	dc_event_devinfo_t devinfo;
+	devinfo.model = data[0];
+	devinfo.firmware = 0;
+	devinfo.serial = array_uint24_le (data + 1);
+	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
 
 	return DC_STATUS_SUCCESS;
 }
@@ -393,13 +400,6 @@ cressi_leonardo_device_foreach (dc_device_t *abstract, dc_dive_callback_t callba
 		dc_buffer_free (buffer);
 		return rc;
 	}
-
-	unsigned char *data = dc_buffer_get_data (buffer);
-	dc_event_devinfo_t devinfo;
-	devinfo.model = data[0];
-	devinfo.firmware = 0;
-	devinfo.serial = array_uint24_le (data + 1);
-	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
 
 	rc = cressi_leonardo_extract_dives (abstract, dc_buffer_get_data (buffer),
 		dc_buffer_get_size (buffer), callback, userdata);

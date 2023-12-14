@@ -30,14 +30,13 @@
 #include <fcntl.h>	// fcntl
 #include <termios.h>	// tcgetattr, tcsetattr, cfsetispeed, cfsetospeed, tcflush, tcsendbreak
 #include <sys/ioctl.h>	// ioctl
-#include <time.h>	// nanosleep
+#include <sys/select.h>	// select
 #ifdef HAVE_LINUX_SERIAL_H
 #include <linux/serial.h>
 #endif
 #ifdef HAVE_IOKIT_SERIAL_IOSS_H
 #include <IOKit/serial/ioss.h>
 #endif
-#include <stdio.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <fnmatch.h>
@@ -59,6 +58,7 @@
 #include "iostream-private.h"
 #include "iterator-private.h"
 #include "descriptor-private.h"
+#include "platform.h"
 #include "timer.h"
 
 #define DIRNAME "/dev"
@@ -88,7 +88,7 @@ struct dc_serial_device_t {
 
 typedef struct dc_serial_iterator_t {
 	dc_iterator_t base;
-	dc_filter_t filter;
+	dc_descriptor_t *descriptor;
 	DIR *dp;
 } dc_serial_iterator_t;
 
@@ -189,7 +189,7 @@ dc_serial_iterator_new (dc_iterator_t **out, dc_context_t *context, dc_descripto
 		goto error_free;
 	}
 
-	iterator->filter = dc_descriptor_get_filter (descriptor);
+	iterator->descriptor = descriptor;
 
 	*out = (dc_iterator_t *) iterator;
 
@@ -225,12 +225,12 @@ dc_serial_iterator_next (dc_iterator_t *abstract, void *out)
 				continue;
 
 			char filename[sizeof(device->name)];
-			int n = snprintf (filename, sizeof (filename), "%s/%s", DIRNAME, ep->d_name);
+			int n = dc_platform_snprintf (filename, sizeof (filename), "%s/%s", DIRNAME, ep->d_name);
 			if (n < 0 || (size_t) n >= sizeof (filename)) {
 				return DC_STATUS_NOMEMORY;
 			}
 
-			if (iterator->filter && !iterator->filter (DC_TRANSPORT_SERIAL, filename)) {
+			if (!dc_descriptor_filter (iterator->descriptor, DC_TRANSPORT_SERIAL, filename, NULL)) {
 				continue;
 			}
 
@@ -995,16 +995,10 @@ dc_serial_get_lines (dc_iostream_t *abstract, unsigned int *value)
 static dc_status_t
 dc_serial_sleep (dc_iostream_t *abstract, unsigned int timeout)
 {
-	struct timespec ts;
-	ts.tv_sec  = (timeout / 1000);
-	ts.tv_nsec = (timeout % 1000) * 1000000;
-
-	while (nanosleep (&ts, &ts) != 0) {
+	if (dc_platform_sleep (timeout) != 0) {
 		int errcode = errno;
-		if (errcode != EINTR ) {
-			SYSERROR (abstract->context, errcode);
-			return syserror (errcode);
-		}
+		SYSERROR (abstract->context, errcode);
+		return syserror (errcode);
 	}
 
 	return DC_STATUS_SUCCESS;

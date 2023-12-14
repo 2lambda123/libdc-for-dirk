@@ -29,6 +29,7 @@
 #include <pthread.h>
 #endif
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #include <windows.h>
 #endif
@@ -43,6 +44,7 @@
 
 #if defined(USE_LIBUSB)
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #endif
 #include <libusb.h>
@@ -84,6 +86,7 @@ struct dc_usbhid_device_t {
 	int interface;
 	unsigned char endpoint_in;
 	unsigned char endpoint_out;
+	unsigned short packetsize;
 #elif defined(USE_HIDAPI)
 	char *path;
 #endif
@@ -102,7 +105,7 @@ static dc_status_t dc_usbhid_close (dc_iostream_t *iostream);
 
 typedef struct dc_usbhid_iterator_t {
 	dc_iterator_t base;
-	dc_filter_t filter;
+	dc_descriptor_t *descriptor;
 	dc_usbhid_session_t *session;
 #if defined(USE_LIBUSB)
 	struct libusb_device **devices;
@@ -123,6 +126,7 @@ typedef struct dc_usbhid_t {
 	int interface;
 	unsigned char endpoint_in;
 	unsigned char endpoint_out;
+	unsigned short packetsize;
 	unsigned int timeout;
 #elif defined(USE_HIDAPI)
 	hid_device *handle;
@@ -398,7 +402,7 @@ dc_usbhid_iterator_new (dc_iterator_t **out, dc_context_t *context, dc_descripto
 	iterator->devices = devices;
 	iterator->current = devices;
 #endif
-	iterator->filter = dc_descriptor_get_filter (descriptor);
+	iterator->descriptor = descriptor;
 
 	*out = (dc_iterator_t *) iterator;
 
@@ -435,7 +439,7 @@ dc_usbhid_iterator_next (dc_iterator_t *abstract, void *out)
 		}
 
 		dc_usb_desc_t usb = {dev.idVendor, dev.idProduct};
-		if (iterator->filter && !iterator->filter (DC_TRANSPORT_USBHID, &usb)) {
+		if (!dc_descriptor_filter (iterator->descriptor, DC_TRANSPORT_USBHID, &usb, NULL)) {
 			continue;
 		}
 
@@ -505,6 +509,7 @@ dc_usbhid_iterator_next (dc_iterator_t *abstract, void *out)
 		device->interface = interface->bInterfaceNumber;
 		device->endpoint_in = ep_in->bEndpointAddress;
 		device->endpoint_out = ep_out->bEndpointAddress;
+		device->packetsize = ep_in->wMaxPacketSize;
 
 		*(dc_usbhid_device_t **) out = device;
 
@@ -518,7 +523,7 @@ dc_usbhid_iterator_next (dc_iterator_t *abstract, void *out)
 		iterator->current = current->next;
 
 		dc_usb_desc_t usb = {current->vendor_id, current->product_id};
-		if (iterator->filter && !iterator->filter (DC_TRANSPORT_USBHID, &usb)) {
+		if (!dc_descriptor_filter (iterator->descriptor, DC_TRANSPORT_USBHID, &usb, NULL)) {
 			continue;
 		}
 
@@ -612,6 +617,7 @@ dc_usbhid_open (dc_iostream_t **out, dc_context_t *context, dc_usbhid_device_t *
 	usbhid->interface = device->interface;
 	usbhid->endpoint_in = device->endpoint_in;
 	usbhid->endpoint_out = device->endpoint_out;
+	usbhid->packetsize = device->packetsize;
 	usbhid->timeout = 0;
 
 #elif defined(USE_HIDAPI)
@@ -702,11 +708,17 @@ dc_usbhid_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual
 	int nbytes = 0;
 
 #if defined(USE_LIBUSB)
+	if (size > usbhid->packetsize) {
+		size = usbhid->packetsize;
+	}
+
 	int rc = libusb_interrupt_transfer (usbhid->handle, usbhid->endpoint_in, data, size, &nbytes, usbhid->timeout);
-	if (rc != LIBUSB_SUCCESS) {
+	if (rc != LIBUSB_SUCCESS || nbytes < 0) {
 		ERROR (abstract->context, "Usb read interrupt transfer failed (%s).",
 			libusb_error_name (rc));
 		status = syserror (rc);
+		if (nbytes < 0)
+			nbytes = 0;
 		goto out;
 	}
 #elif defined(USE_HIDAPI)
@@ -749,10 +761,12 @@ dc_usbhid_write (dc_iostream_t *abstract, const void *data, size_t size, size_t 
 	}
 
 	int rc = libusb_interrupt_transfer (usbhid->handle, usbhid->endpoint_out, (void *) buffer, length, &nbytes, 0);
-	if (rc != LIBUSB_SUCCESS) {
+	if (rc != LIBUSB_SUCCESS || nbytes < 0) {
 		ERROR (abstract->context, "Usb write interrupt transfer failed (%s).",
 			libusb_error_name (rc));
 		status = syserror (rc);
+		if (nbytes < 0)
+			nbytes = 0;
 		goto out;
 	}
 
@@ -771,7 +785,7 @@ dc_usbhid_write (dc_iostream_t *abstract, const void *data, size_t size, size_t 
 
 out:
 #ifdef _WIN32
-	if (nbytes > size) {
+	if ((size_t) nbytes > size) {
 		WARNING (abstract->context, "Number of bytes exceeds the buffer size (" DC_PRINTF_SIZE " > " DC_PRINTF_SIZE ")!", nbytes, size);
 		nbytes = size;
 	}

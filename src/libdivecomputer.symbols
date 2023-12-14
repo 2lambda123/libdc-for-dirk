@@ -8,6 +8,7 @@ dc_buffer_reserve
 dc_buffer_resize
 dc_buffer_append
 dc_buffer_prepend
+dc_buffer_insert
 dc_buffer_slice
 dc_buffer_get_size
 dc_buffer_get_data
@@ -70,6 +71,12 @@ dc_irda_device_free
 dc_irda_iterator_new
 dc_irda_open
 
+dc_usb_device_get_vid
+dc_usb_device_get_pid
+dc_usb_device_free
+dc_usb_iterator_new
+dc_usb_open
+
 dc_usbhid_device_get_vid
 dc_usbhid_device_get_pid
 dc_usbhid_device_free
@@ -82,6 +89,9 @@ dc_custom_open
 
 dc_parser_new
 dc_parser_new2
+dc_parser_set_clock
+dc_parser_set_atmospheric
+dc_parser_set_density
 dc_parser_get_type
 dc_parser_set_data
 dc_parser_get_datetime

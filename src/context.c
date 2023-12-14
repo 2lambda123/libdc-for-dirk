@@ -25,15 +25,17 @@
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
+#include <limits.h>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #include <windows.h>
 #endif
 
 #include "context-private.h"
+#include "platform.h"
 #include "timer.h"
 
 struct dc_context_t {
@@ -47,55 +49,6 @@ struct dc_context_t {
 };
 
 #ifdef ENABLE_LOGGING
-/*
- * A wrapper for the vsnprintf function, which will always null terminate the
- * string and returns a negative value if the destination buffer is too small.
- */
-static int
-l_vsnprintf (char *str, size_t size, const char *format, va_list ap)
-{
-	int n;
-
-	if (size == 0)
-		return -1;
-
-#ifdef _MSC_VER
-	/*
-	 * The non-standard vsnprintf implementation provided by MSVC doesn't null
-	 * terminate the string and returns a negative value if the destination
-	 * buffer is too small.
-	 */
-	n = _vsnprintf (str, size - 1, format, ap);
-	if (n == size - 1 || n < 0)
-		str[size - 1] = 0;
-#else
-	/*
-	 * The C99 vsnprintf function will always null terminate the string. If the
-	 * destination buffer is too small, the return value is the number of
-	 * characters that would have been written if the buffer had been large
-	 * enough.
-	 */
-	n = vsnprintf (str, size, format, ap);
-	if (n >= size)
-		n = -1;
-#endif
-
-	return n;
-}
-
-static int
-l_snprintf (char *str, size_t size, const char *format, ...)
-{
-	va_list ap;
-	int n;
-
-	va_start (ap, format);
-	n = l_vsnprintf (str, size, format, ap);
-	va_end (ap);
-
-	return n;
-}
-
 static int
 l_hexdump (char *str, size_t size, const unsigned char data[], size_t n)
 {
@@ -103,7 +56,7 @@ l_hexdump (char *str, size_t size, const unsigned char data[], size_t n)
 		'0', '1', '2', '3', '4', '5', '6', '7',
 		'8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
-	if (size == 0)
+	if (size == 0 || size > INT_MAX)
 		return -1;
 
 	/* The maximum number of bytes. */
@@ -125,11 +78,11 @@ l_hexdump (char *str, size_t size, const unsigned char data[], size_t n)
 	/* Null terminate the hex string. */
 	str[length * 2] = 0;
 
-	return (n > maxlength ? -1 : length * 2);
+	return (n > maxlength ? -1 : (int) (length * 2));
 }
 
 static void
-logfunc (dc_context_t *context, dc_loglevel_t loglevel, const char *file, unsigned int line, const char *function, const char *msg, void *userdata)
+loghandler (dc_context_t *context, dc_loglevel_t loglevel, const char *file, unsigned int line, const char *function, const char *msg, void *userdata)
 {
 	const char *loglevels[] = {"NONE", "ERROR", "WARNING", "INFO", "DEBUG", "ALL"};
 
@@ -165,7 +118,7 @@ dc_context_new (dc_context_t **out)
 
 #ifdef ENABLE_LOGGING
 	context->loglevel = DC_LOGLEVEL_WARNING;
-	context->logfunc = logfunc;
+	context->logfunc = loghandler;
 #else
 	context->loglevel = DC_LOGLEVEL_NONE;
 	context->logfunc = NULL;
@@ -242,7 +195,7 @@ dc_context_log (dc_context_t *context, dc_loglevel_t loglevel, const char *file,
 		return DC_STATUS_SUCCESS;
 
 	va_start (ap, format);
-	l_vsnprintf (context->msg, sizeof (context->msg), format, ap);
+	dc_platform_vsnprintf (context->msg, sizeof (context->msg), format, ap);
 	va_end (ap);
 
 	context->logfunc (context, loglevel, file, line, function, context->msg, context->userdata);
@@ -308,7 +261,7 @@ dc_context_hexdump (dc_context_t *context, dc_loglevel_t loglevel, const char *f
 	if (context->logfunc == NULL)
 		return DC_STATUS_SUCCESS;
 
-	n = l_snprintf (context->msg, sizeof (context->msg), "%s: size=%u, data=", prefix, size);
+	n = dc_platform_snprintf (context->msg, sizeof (context->msg), "%s: size=%u, data=", prefix, size);
 
 	if (n >= 0) {
 		n = l_hexdump (context->msg + n, sizeof (context->msg) - n, data, size);

@@ -24,7 +24,6 @@
 #endif
 
 #include <stdlib.h> // malloc, free
-#include <stdio.h>	// snprintf
 #include <string.h>
 
 #include "socket.h"
@@ -155,7 +154,7 @@ dc_irda_iterator_new (dc_iterator_t **out, dc_context_t *context, dc_descriptor_
 	}
 
 	// Open the socket.
-	int fd = socket (AF_IRDA, SOCK_STREAM, 0);
+	s_socket_t fd = socket (AF_IRDA, SOCK_STREAM, 0);
 	if (fd == S_INVALID) {
 		s_errcode_t errcode = S_ERRNO;
 		SYSERROR (context, errcode);
@@ -202,17 +201,11 @@ dc_irda_iterator_new (dc_iterator_t **out, dc_context_t *context, dc_descriptor_
 		// modified by the previous getsockopt call.
 		size = sizeof (data);
 
-#ifdef _WIN32
-		Sleep (1000);
-#else
-		sleep (1);
-#endif
+		dc_platform_sleep (1000);
 	}
 
 	S_CLOSE (fd);
 	dc_socket_exit (context);
-
-	dc_filter_t filter = dc_descriptor_get_filter (descriptor);
 
 	unsigned int count = 0;
 #ifdef _WIN32
@@ -233,7 +226,7 @@ dc_irda_iterator_new (dc_iterator_t **out, dc_context_t *context, dc_descriptor_
 		INFO (context, "Discover: address=%08x, name=%s, charset=%02x, hints=%04x",
 			address, name, charset, hints);
 
-		if (filter && !filter (DC_TRANSPORT_IRDA, name)) {
+		if (!dc_descriptor_filter (descriptor, DC_TRANSPORT_IRDA, name, NULL)) {
 			continue;
 		}
 
@@ -320,7 +313,7 @@ dc_irda_open (dc_iostream_t **out, dc_context_t *context, unsigned int address, 
 	peer.irdaDeviceID[1] = (address >>  8) & 0xFF;
 	peer.irdaDeviceID[2] = (address >> 16) & 0xFF;
 	peer.irdaDeviceID[3] = (address >> 24) & 0xFF;
-	snprintf (peer.irdaServiceName, sizeof(peer.irdaServiceName), "LSAP-SEL%u", lsap);
+	dc_platform_snprintf (peer.irdaServiceName, sizeof(peer.irdaServiceName), "LSAP-SEL%u", lsap);
 #else
 	struct sockaddr_irda peer;
 	peer.sir_family = AF_IRDA;

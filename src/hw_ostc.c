@@ -31,8 +31,6 @@
 
 #define ISINSTANCE(device) dc_device_isinstance((device), &hw_ostc_device_vtable)
 
-#define C_ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
-
 #define MAXRETRIES 9
 
 #define FW_190 0x015A
@@ -274,6 +272,20 @@ hw_ostc_device_dump (dc_device_t *abstract, dc_buffer_t *buffer)
 		nbytes += len;
 	}
 
+	// Emit a device info event.
+	dc_event_devinfo_t devinfo;
+	devinfo.firmware = array_uint16_be (data + 264);
+	devinfo.serial = array_uint16_le (data + 6);
+	if (devinfo.serial > 7000)
+		devinfo.model = 3; // OSTC 2C
+	else if (devinfo.serial > 2048)
+		devinfo.model = 2; // OSTC 2N
+	else if (devinfo.serial > 300)
+		devinfo.model = 1; // OSTC Mk2
+	else
+		devinfo.model = 0; // OSTC
+	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
+
 	return DC_STATUS_SUCCESS;
 }
 
@@ -290,21 +302,6 @@ hw_ostc_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void
 		dc_buffer_free (buffer);
 		return rc;
 	}
-
-	// Emit a device info event.
-	unsigned char *data = dc_buffer_get_data (buffer);
-	dc_event_devinfo_t devinfo;
-	devinfo.firmware = array_uint16_be (data + 264);
-	devinfo.serial = array_uint16_le (data + 6);
-	if (devinfo.serial > 7000)
-		devinfo.model = 3; // OSTC 2C
-	else if (devinfo.serial > 2048)
-		devinfo.model = 2; // OSTC 2N
-	else if (devinfo.serial > 300)
-		devinfo.model = 1; // OSTC Mk2
-	else
-		devinfo.model = 0; // OSTC
-	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
 
 	rc = hw_ostc_extract_dives (abstract, dc_buffer_get_data (buffer),
 		dc_buffer_get_size (buffer), callback, userdata);
@@ -350,11 +347,6 @@ hw_ostc_device_timesync (dc_device_t *abstract, const dc_datetime_t *datetime)
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
 	hw_ostc_device_t *device = (hw_ostc_device_t *) abstract;
-
-	if (datetime == NULL) {
-		ERROR (abstract->context, "Invalid parameter specified.");
-		return DC_STATUS_INVALIDARGS;
-	}
 
 	// Send the command.
 	dc_status_t rc = hw_ostc_send (device, 'b', 1);

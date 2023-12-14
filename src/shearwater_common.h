@@ -34,14 +34,24 @@ extern "C" {
 #define ID_FIRMWARE  0x8011
 #define ID_LOGUPLOAD 0x8021
 #define ID_HARDWARE  0x8050
+#define ID_LOCAL_TIME 0x9030
+#define ID_UTC_TIME  0x9031
+#define ID_LOCAL_TIME_OFFSET 0x9032
+#define ID_LOCAL_TIME_DST 0x9033
+
+#define WDBI_TIME_PACKET_SIZE 7
 
 #define PREDATOR 2
 #define PETREL   3
+#define PETREL2  PETREL
 #define NERD     4
 #define PERDIX   5
 #define PERDIXAI 6
 #define NERD2    7
 #define TERIC    8
+#define PEREGRINE 9
+#define PETREL3  10
+#define PERDIX2  11
 
 #define NSTEPS    10000
 #define STEP(i,n) ((NSTEPS * (i) + (n) / 2) / (n))
@@ -62,6 +72,12 @@ shearwater_common_download (shearwater_common_device_t *device, dc_buffer_t *buf
 
 dc_status_t
 shearwater_common_identifier (shearwater_common_device_t *device, dc_buffer_t *buffer, unsigned int id);
+
+dc_status_t shearwater_common_can_wdbi (shearwater_common_device_t *device, dc_buffer_t *buffer, unsigned int id);
+
+dc_status_t shearwater_common_device_timesync(dc_device_t *abstract, const dc_datetime_t *datetime);
+
+dc_status_t shearwater_common_read_model(shearwater_common_device_t *device, unsigned int *model);
 
 #ifdef __cplusplus
 }

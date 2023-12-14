@@ -238,7 +238,7 @@ dctool_xml_output_write (dctool_output_t *abstract, dc_parser_t *parser, const u
 		fprintf (output->ostream, "<datetime>%04i-%02i-%02i %02i:%02i:%02i %+03i:%02i</datetime>\n",
 			dt.year, dt.month, dt.day,
 			dt.hour, dt.minute, dt.second,
-			dt.timezone / 3600, (dt.timezone % 3600) / 60);
+			dt.timezone / 3600, (abs(dt.timezone) % 3600) / 60);
 	}
 
 	// Parse the divetime.
@@ -384,6 +384,30 @@ dctool_xml_output_write (dctool_output_t *abstract, dc_parser_t *parser, const u
 		const char *names[] = {"freedive", "gauge", "oc", "ccr", "scr"};
 		fprintf (output->ostream, "<divemode>%s</divemode>\n",
 			names[divemode]);
+	}
+
+	// Parse the deco model.
+	message ("Parsing the deco model.\n");
+	dc_decomodel_t decomodel = {DC_DECOMODEL_NONE};
+	status = dc_parser_get_field (parser, DC_FIELD_DECOMODEL, 0, &decomodel);
+	if (status != DC_STATUS_SUCCESS && status != DC_STATUS_UNSUPPORTED) {
+		ERROR ("Error parsing the deco model.");
+		goto cleanup;
+	}
+
+	if (status != DC_STATUS_UNSUPPORTED) {
+		const char *names[] = {"none", "buhlmann", "vpm", "rgbm", "dciem"};
+		fprintf (output->ostream, "<decomodel>%s</decomodel>\n",
+			names[decomodel.type]);
+		if (decomodel.type == DC_DECOMODEL_BUHLMANN &&
+			(decomodel.params.gf.low != 0 || decomodel.params.gf.high != 0)) {
+			fprintf (output->ostream, "<gf>%u/%u</gf>\n",
+				decomodel.params.gf.low, decomodel.params.gf.high);
+		}
+		if (decomodel.conservatism) {
+			fprintf (output->ostream, "<conservatism>%d</conservatism>\n",
+				decomodel.conservatism);
+		}
 	}
 
 	// Parse the salinity.

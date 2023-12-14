@@ -35,7 +35,6 @@
 #include "uwatec_memomouse.h"
 #include "uwatec_smart.h"
 #include "oceanic_atom2.h"
-#include "oceanic_atom2.h"
 #include "oceanic_veo250.h"
 #include "oceanic_vtpro.h"
 #include "mares_darwin.h"
@@ -57,9 +56,17 @@
 #include "divesystem_idive.h"
 #include "cochran_commander.h"
 #include "tecdiving_divecomputereu.h"
-#include "garmin.h"
-#include "deepblu.h"
 #include "mclean_extreme.h"
+#include "liquivision_lynx.h"
+#include "sporasub_sp2.h"
+#include "deepsix_excursion.h"
+#include "seac_screen.h"
+#include "deepblu_cosmiq.h"
+#include "oceans_s1.h"
+#include "divesoft_freedom.h"
+
+// Not merged upstream yet
+#include "garmin.h"
 
 #include "context-private.h"
 #include "parser-private.h"
@@ -87,7 +94,7 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, dc_family_t fa
 		if (model == 0x01)
 			rc = suunto_eon_parser_create (&parser, context, 1);
 		else
-			rc = suunto_vyper_parser_create (&parser, context);
+			rc = suunto_vyper_parser_create (&parser, context, serial);
 		break;
 	case DC_FAMILY_SUUNTO_VYPER2:
 	case DC_FAMILY_SUUNTO_D9:
@@ -101,7 +108,7 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, dc_family_t fa
 		rc = uwatec_memomouse_parser_create (&parser, context, devtime, systime);
 		break;
 	case DC_FAMILY_UWATEC_SMART:
-		rc = uwatec_smart_parser_create (&parser, context, model, devtime, systime);
+		rc = uwatec_smart_parser_create (&parser, context, model);
 		break;
 	case DC_FAMILY_REEFNET_SENSUS:
 		rc = reefnet_sensus_parser_create (&parser, context, devtime, systime);
@@ -132,7 +139,7 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, dc_family_t fa
 		rc = mares_darwin_parser_create (&parser, context, model);
 		break;
 	case DC_FAMILY_MARES_ICONHD:
-		rc = mares_iconhd_parser_create (&parser, context, model);
+		rc = mares_iconhd_parser_create (&parser, context, model, serial);
 		break;
 	case DC_FAMILY_HW_OSTC:
 		rc = hw_ostc_parser_create (&parser, context, serial);
@@ -175,17 +182,37 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, dc_family_t fa
 	case DC_FAMILY_TECDIVING_DIVECOMPUTEREU:
 		rc = tecdiving_divecomputereu_parser_create (&parser, context);
 		break;
-	case DC_FAMILY_GARMIN:
-		rc = garmin_parser_create (&parser, context);
-		break;
-	case DC_FAMILY_DEEPBLU:
-		rc = deepblu_parser_create (&parser, context);
-		break;
 	case DC_FAMILY_MCLEAN_EXTREME:
-		rc = mclean_extreme_parser_create(&parser, context);
+		rc = mclean_extreme_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_LIQUIVISION_LYNX:
+		rc = liquivision_lynx_parser_create (&parser, context, model);
+		break;
+	case DC_FAMILY_SPORASUB_SP2:
+		rc = sporasub_sp2_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_DEEPSIX_EXCURSION:
+		rc = deepsix_excursion_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_SEAC_SCREEN:
+		rc = seac_screen_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_DEEPBLU_COSMIQ:
+		rc = deepblu_cosmiq_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_OCEANS_S1:
+		rc = oceans_s1_parser_create (&parser, context);
+		break;
+	case DC_FAMILY_DIVESOFT_FREEDOM:
+		rc = divesoft_freedom_parser_create (&parser, context);
 		break;
 	default:
 		return DC_STATUS_INVALIDARGS;
+
+	// Not merged upstream yet
+	case DC_FAMILY_GARMIN:
+		rc = garmin_parser_create (&parser, context);
+		break;
 	}
 
 	*out = parser;
@@ -263,6 +290,45 @@ dc_parser_get_type (dc_parser_t *parser)
 		return DC_FAMILY_NULL;
 
 	return parser->vtable->type;
+}
+
+
+dc_status_t
+dc_parser_set_clock (dc_parser_t *parser, unsigned int devtime, dc_ticks_t systime)
+{
+	if (parser == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	if (parser->vtable->set_clock == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	return parser->vtable->set_clock (parser, devtime, systime);
+}
+
+
+dc_status_t
+dc_parser_set_atmospheric (dc_parser_t *parser, double atmospheric)
+{
+	if (parser == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	if (parser->vtable->set_atmospheric == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	return parser->vtable->set_atmospheric (parser, atmospheric);
+}
+
+
+dc_status_t
+dc_parser_set_density (dc_parser_t *parser, double density)
+{
+	if (parser == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	if (parser->vtable->set_density == NULL)
+		return DC_STATUS_UNSUPPORTED;
+
+	return parser->vtable->set_density (parser, density);
 }
 
 
